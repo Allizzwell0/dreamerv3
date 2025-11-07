@@ -213,7 +213,7 @@ def make_env(config, index, **overrides):
   suite, task = config.task.split('_', 1)
   if suite == 'memmaze':
     from embodied.envs import from_gym
-    import memory_maze  # noqa
+    # import memory_maze  # noqa
   ctor = {
       'dummy': 'embodied.envs.dummy:Dummy',
       'gym': 'embodied.envs.from_gym:FromGym',

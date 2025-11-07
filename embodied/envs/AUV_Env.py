@@ -148,7 +148,9 @@ class AUVEnv(embodied.Env):
         obs = np.array([
             xe, ye, pose,
             np.cos(self.state_pos[2]), np.sin(self.state_pos[2]),
-            self.state_vel[0], self.state_vel[1], self.state_vel[2]
+            self.state_vel[0], self.state_vel[1], self.state_vel[2],
+            self.state_pos[0], self.state_pos[1],
+            self.goal[0], self.goal[1]
         ], dtype=np.float32)
 
         return dict(
@@ -182,7 +184,9 @@ class AUVEnv(embodied.Env):
         obs = np.array([
             xe, ye, pose,
             np.cos(self.state_pos[2]), np.sin(self.state_pos[2]),
-            self.state_vel[0], self.state_vel[1], self.state_vel[2]
+            self.state_vel[0], self.state_vel[1], self.state_vel[2],
+            self.state_pos[0], self.state_pos[1],
+            self.goal[0], self.goal[1]
         ], dtype=np.float32)
 
         return dict(
