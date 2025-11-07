@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info
 MUJOCO_LOG.TXT
 ;
+Miniconda3-latest-Linux-x86_64.sh
