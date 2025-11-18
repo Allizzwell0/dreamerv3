@@ -58,6 +58,7 @@ def eval_only(make_agent, make_env, make_logger, args):
 
   cp = elements.Checkpoint()
   cp.agent = agent
+  print(f"Loading agent weights from checkpoint: {args.from_checkpoint}")
   cp.load(args.from_checkpoint, keys=['agent'])
 
   print('Start evaluation')

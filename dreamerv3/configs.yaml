@@ -198,7 +198,7 @@ loconav:
 
 auv:
   task: auv_custom
-  run: {envs: 4, steps: 1.0e6, train_ratio: 1024}
+  run: {envs: 1, steps: 1.0e6, train_ratio: 1024}
   # env.auv.image: False   # no vision
   # env.auv.proprio: True  # use state information (pose, velocity, etc.)
 

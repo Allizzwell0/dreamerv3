@@ -1,224 +1,308 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluate a trained DreamerV3 policy on the AUVEnv and export trajectories to CSV,
+Evaluate a trained DreamerV3 policy on the (CONTINUOUS-ACTION) AUVEnv and export trajectories to CSV,
 along with summary metrics.
 
 Usage:
-  python eval_auv.py --ckpt ~/logdir/auv/20251106T161609 --episodes 20 --out_csv eval_trajectories.csv
+  python eval_auv.py --ckpt ~/logdir/auv/20251106T161609 \
+    --episodes 200 --out_dir ~/logdir/auv/20251106T161609/eval_output
 
 Notes:
-- If DreamerV3 checkpoint loading fails or isn't provided, a RandomFallbackPolicy is used
-  so the pipeline still runs end-to-end.
-- Works with the AUVEnv you shared (8-dim vector obs). If your obs includes x,y,goal_x,goal_y
-  (12-dim), this script will auto-detect and record them into the CSV.
+- This version assumes your AUVEnv uses CONTINUOUS actions (e.g. action ∈ [-1,1]^2).
+- If DreamerV3 checkpoint loading fails or isn't provided, a RandomContinuousPolicy is used.
+- If obs includes x,y,goal_x,goal_y (12-dim), they are auto-recorded into the CSV.
 """
-import os
+from __future__ import annotations
+
+import argparse
 import csv
 import math
-import json
-import time
-import argparse
+import os
 from pathlib import Path
+from typing import Dict, Optional, Any
+
 import numpy as np
 
 # ===== MODIFY THIS IMPORT TO MATCH YOUR ENV PATH =====
-# Example: from auv_env import AUVEnv
 try:
-    from embodied.envs.AUV_Env import AUVEnv  
+    from embodied.envs.AUV_Env import AUVEnv
 except Exception as e:
-    raise ImportError("Failed to import AUVEnv. Please edit the import path in eval_auv.py "
-                      "to point to your environment class.\n"
-                      f"Original error: {e}")
+    raise ImportError(
+        "Failed to import AUVEnv. Please edit the import path in eval_auv.py "
+        "to point to your environment class.\n"
+        f"Original error: {e}"
+    )
 
 
-class RandomFallbackPolicy:
-    """Fallback policy for testing the evaluation pipeline if a real policy isn't available."""
-    def reset(self):
+# ------------ 连续动作 fallback 策略 ------------
+
+class RandomContinuousPolicy:
+    """连续动作的 fallback 策略：action ∈ [low, high]^n."""
+    def __init__(self, act_low, act_high, seed: int = 0):
+        self.low = np.array(act_low, dtype=np.float32)
+        self.high = np.array(act_high, dtype=np.float32)
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self) -> None:
         pass
-    def __call__(self, obs):
-        a = np.random.uniform(-1.0, 1.0, size=(2,)).astype(np.float32)
-        return {'reset': False, 'action': a}
+
+    def __call__(self, obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        _ = obs
+        a = self.rng.uniform(self.low, self.high)
+        return {"reset": False, "action": a.astype(np.float32)}
 
 
-def load_trained_policy(checkpoint_dir=None):
+# ------------ 按 main + eval_only 风格加载 DreamerV3 agent 权重（连续动作） ------------
+
+def load_trained_policy(
+    checkpoint_dir: Optional[str],
+    act_shape,
+    act_low,
+    act_high,
+    seed: int = 0,
+):
     """
-    Try to load a DreamerV3 policy from a checkpoint directory.
-    Expected structure (from your logdir):
-      ckpt/ , config.yaml , metrics.jsonl , ...
-    Returns an object with .reset() and __call__(obs)->action_dict
-    If loading fails, returns RandomFallbackPolicy.
+    连续动作版：
+    - 用 dreamerv3/main.py 里的 make_agent(config) 构造 Agent（和训练完全一致）
+    - 用 elements.Checkpoint() 加载 agent 权重（风格参照 embodied/run/eval_only.py）
+    - 输出连续动作向量（直接传给 AUVEnv）
     """
     if checkpoint_dir is None:
-        print("[eval_auv] No checkpoint provided. Using RandomFallbackPolicy.")
-        return RandomFallbackPolicy()
+        print("[eval_auv] No checkpoint provided. Using RandomContinuousPolicy.")
+        return RandomContinuousPolicy(act_low, act_high, seed)
 
-    checkpoint_dir = str(Path(checkpoint_dir).expanduser())
-    config_path = Path(checkpoint_dir) / "config.yaml"
-    ckpt_dir = Path(checkpoint_dir) / "ckpt"
+    run_dir = Path(checkpoint_dir).expanduser()
+    if not run_dir.exists():
+        print(f"[eval_auv] Checkpoint dir '{run_dir}' does not exist. Using RandomContinuousPolicy.")
+        return RandomContinuousPolicy(act_low, act_high, seed)
+
+    # 优先在 run_dir/config.yaml 找 config；找不到再尝试父目录
+    config_path = run_dir / "config.yaml"
     if not config_path.exists():
-        # maybe the user passed the parent directory
-        parent_config = Path(checkpoint_dir).parent / "config.yaml"
+        parent_config = run_dir.parent / "config.yaml"
         if parent_config.exists():
             config_path = parent_config
 
+    if not config_path.exists():
+        print(f"[eval_auv] config.yaml not found near '{run_dir}'. Using RandomContinuousPolicy.")
+        return RandomContinuousPolicy(act_low, act_high, seed)
+
     try:
-        import embodied
-        from embodied.core import checkpoint as ckpt_core
-        # DreamerV3 agent import may differ by install; try common paths:
-        try:
-            from dreamerv3.agent import Agent as DreamerAgent
-        except Exception:
-            # Fallback older/newer layouts
-            from dreamerv3 import agent as dreamer_agent
-            DreamerAgent = dreamer_agent.Agent
+        import elements
+        import ruamel.yaml as yaml
+        from dreamerv3 import main as dv3_main
 
-        # Load config; embodied.Config.load_yaml usually expects a path string
-        if config_path.exists():
-            cfg = embodied.Config(embodied.Config.load_yaml(str(config_path)))
-        else:
-            print(f"[eval_auv] Warning: config.yaml not found near {checkpoint_dir}. Using defaults.")
-            cfg = embodied.Config()
+        # -------- 1) 读取 config.yaml -> elements.Config --------
+        cfg_text = config_path.read_text(encoding="utf-8")
+        raw_cfg = yaml.YAML(typ="safe").load(cfg_text)
+        config = elements.Config(raw_cfg)
+        # 确保 logdir 指向当前 run_dir
+        config = config.update(logdir=str(run_dir))
+        # print(f"[eval_auv] Loaded DreamerV3 config from '{config_path}'.")
 
-        # logdir should be the run folder (the directory with ckpt/ etc.)
-        cfg.logdir = checkpoint_dir
+        # -------- 2) 用 main 里的 make_agent 构造 Agent --------
+        # 和训练时完全一致（内部会调用 make_env + wrap_env）
+        agent = dv3_main.make_agent(config)
+        # print(f"[eval_auv] Created DreamerV3 agent from config at '{config_path}'.")
 
-        agent = DreamerAgent(cfg)
+        # -------- 3) 用 elements.Checkpoint 加载 agent 权重 --------
+        # 参照 embodied/run/eval_only.py:
+        #   cp = elements.Checkpoint()
+        #   cp.agent = agent
+        #   cp.load(args.from_checkpoint, keys=['agent'])
+        import elements as _elements  # 复用同一个 elements 模块
+        cp = _elements.Checkpoint()
+        cp.agent = agent
+        # print(f"[eval_auv] Loading DreamerV3 agent weights from checkpoint...")
 
-        # Load weights
-        # Depending on version, you either load from run dir or ckpt dir
-        if ckpt_dir.exists():
-            ck = ckpt_core.Checkpoint(str(ckpt_dir))
-        else:
-            ck = ckpt_core.Checkpoint(str(checkpoint_dir))
-        ck.load(agent)
-        print(f"[eval_auv] Loaded DreamerV3 agent from {checkpoint_dir}")
+        ckpt_root = run_dir / "ckpt"
+        # 如果传进来的是 run_dir（包含 ckpt/），优先从 ckpt/ 加载；否则尝试直接从 run_dir 加载
+        load_root = ckpt_root if ckpt_root.exists() else run_dir
 
-        class Policy:
-            def __init__(self, agent):
-                self.agent = agent
+        cp.load(str(load_root), keys=["agent"])
+        print(f"[eval_auv] Loaded DreamerV3 agent weights from {load_root}")
+
+        # -------- 4) 连续动作封装（直接把 Dreamer 的动作传给 env） --------
+        act_shape = tuple(act_shape)
+
+        class ContinuousPolicyWrapper:
+            def __init__(self, agent_, act_shape_, seed_):
+                self.agent = agent_
+                self.act_shape = act_shape_
                 self.state = None
-            def reset(self):
+                self.rng = np.random.default_rng(seed_)
+
+            def reset(self) -> None:
                 self.state = None
-            def __call__(self, obs):
-                # Expect obs dict with 'vector' etc.
-                action, self.state = self.agent.policy(obs, self.state, mode='eval')
-                # Ensure correct shape/keys for AUVEnv
-                if isinstance(action, dict):
-                    # passthrough if already in expected dict format
-                    return action
+
+            def __call__(self, obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+                # Dreamer policy 输出 raw_action，可能是 dict / array / tensor
+                raw_action, self.state = self.agent.policy(obs, self.state, mode="eval")
+
+                if isinstance(raw_action, dict):
+                    act = raw_action.get("action", raw_action)
                 else:
-                    # assume continuous action array of size 2
-                    arr = np.asarray(action, dtype=np.float32).reshape(-1)
-                    if arr.size < 2:
-                        # pad if needed
-                        arr = np.pad(arr, (0, 2 - arr.size))
-                    return {'reset': False, 'action': arr[:2]}
+                    act = raw_action
 
-        return Policy(agent)
+                act = np.asarray(act, dtype=np.float32)
+
+                # 如果是 batched (1,2) 之类，拆成 (2,)
+                if act.ndim > 1:
+                    act = act.reshape(-1)[: np.prod(self.act_shape)]
+
+                act = act.reshape(self.act_shape)
+
+                # 通常已经在 [-1,1]，保险起见裁一下
+                act = np.clip(act, -1.0, 1.0)
+
+                return {"reset": False, "action": act}
+
+        return ContinuousPolicyWrapper(agent, act_shape, seed)
 
     except Exception as e:
-        print(f"[eval_auv] Could not load Dreamer policy from '{checkpoint_dir}': {e}")
-        print("[eval_auv] Falling back to RandomFallbackPolicy.")
-        return RandomFallbackPolicy()
+        print(f"[eval_auv] Could not load DreamerV3 policy from '{run_dir}': {e}")
+        print("[eval_auv] Falling back to RandomContinuousPolicy.")
+        return RandomContinuousPolicy(act_low, act_high, seed)
 
+
+# ------------ 评估循环：使用连续动作 policy 在 AUVEnv 上 rollout ------------
 
 def evaluate_auv(
-    policy,
-    episodes=20,
-    dt=0.05,
-    max_steps=500,
-    out_csv="eval_trajectories.csv",
-    seed=0,
-    verbose=True,
-):
+    ckpt_dir: Optional[str],
+    *,
+    episodes: int = 20,
+    dt: float = 0.05,
+    max_steps: int = 500,
+    success_threshold: float = 0.3,
+    out_csv: Path,
+    seed: int = 0,
+    verbose: bool = True,
+) -> Dict[str, float]:
+    """Roll out multiple episodes, compute success rate, and write trajectories."""
+
+    rng = np.random.default_rng(seed)
     env = AUVEnv(dt=dt, max_steps=max_steps)
+
+    # for reproducibility
+    env.np_random.seed(seed)
     np.random.seed(seed)
 
-    header = [
-        "episode", "t", "reward", "discount",
-        "x", "y", "theta", "u", "v", "r",
-        "goal_x", "goal_y",
-        "xe", "ye", "dist",
-        "is_terminal", "is_last"
-    ]
-    out_csv = str(Path(out_csv).expanduser())
-    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    # ---- 连续动作信息，从 env.act_space['action'] 中读取 ----
+    act_space = env.act_space["action"]
+    act_shape = act_space.shape              # 例如 (2,)
+    act_low = getattr(act_space, "low", -1.0)
+    act_high = getattr(act_space, "high", 1.0)
 
-    with open(out_csv, "w", newline="") as f:
+    # build policy AFTER we know action shape / range
+    policy = load_trained_policy(ckpt_dir, act_shape, act_low, act_high, seed)
+
+    header = [
+        "episode",
+        "t",
+        "reward",
+        "discount",
+        "x",
+        "y",
+        "theta",
+        "u",
+        "v",
+        "r",
+        "goal_x",
+        "goal_y",
+        "xe",
+        "ye",
+        "dist",
+        "is_terminal",
+        "is_last",
+    ]
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    ep_returns: list[float] = []
+    ep_lengths: list[int] = []
+    final_dists: list[float] = []
+    successes = 0
+
+    with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
 
-        ep_returns = []
-        ep_lengths = []
-        successes = 0
-        final_dists = []
-
         for ep in range(episodes):
-            traj = env.step({'reset': True})
             policy.reset()
-            done = False
-            ep_return = 0.0
-            t = 0
+            # resample env target/initialization for diversity
+            env_seed = int(rng.integers(0, 2**31 - 1))
+            env.np_random.seed(env_seed)
+            traj = env.step({"reset": True})
 
-            vec = traj['vector']  # [xe, ye, dist, cosθ, sinθ, u, v, r, (maybe x,y,goal_x,goal_y)]
-            # Base fields from 8-dim obs
+            vec = traj["vector"]
             theta = float(math.atan2(vec[4], vec[3]))
-            u, v, r = map(float, vec[5:8])
-            xe, ye, dist = float(vec[0]), float(vec[1]), float(vec[2])
-            # Optional world/goal if provided (12-dim)
-            x = y = goal_x = goal_y = float('nan')
+            u, v, r_val = map(float, vec[5:8])
+            xe, ye, dist = map(float, vec[:3])
+            x = y = goal_x = goal_y = float("nan")
             if len(vec) >= 12:
                 x, y = float(vec[8]), float(vec[9])
                 goal_x, goal_y = float(vec[10]), float(vec[11])
 
-            writer.writerow([ep, t, 0.0, 1.0, x, y, theta, u, v, r,
-                             goal_x, goal_y, xe, ye, dist, False, False])
+            writer.writerow(
+                [ep, 0, 0.0, 1.0, x, y, theta, u, v, r_val, goal_x, goal_y, xe, ye, dist, False, False]
+            )
+
+            ep_return = 0.0
+            final_dist = dist
+            success_flag = dist <= success_threshold
+            steps = 0
 
             for t in range(1, max_steps + 1):
+                steps = t
+                # 连续动作策略：返回 {"reset": False, "action": np.array(shape=act_shape)}
                 action = policy(traj)
                 traj = env.step(action)
-                vec = traj['vector']
+                vec = traj["vector"]
 
                 theta = float(math.atan2(vec[4], vec[3]))
-                u, v, r = map(float, vec[5:8])
-                xe, ye, dist = float(vec[0]), float(vec[1]), float(vec[2])
-
-                # Optional world/goal
+                u, v, r_val = map(float, vec[5:8])
+                xe, ye, dist = map(float, vec[:3])
                 if len(vec) >= 12:
                     x, y = float(vec[8]), float(vec[9])
                     goal_x, goal_y = float(vec[10]), float(vec[11])
                 else:
-                    x = y = goal_x = goal_y = float('nan')
+                    x = y = goal_x = goal_y = float("nan")
 
-                reward = float(traj['reward'])
-                discount = float(traj.get('discount', 1.0))
-                is_last = bool(traj['is_last'])
-                is_terminal = bool(traj['is_terminal'])
+                reward = float(traj["reward"])
+                discount = float(traj.get("discount", 1.0))
+                is_last = bool(traj["is_last"])
+                is_terminal = bool(traj["is_terminal"])
 
                 ep_return += reward
+                final_dist = dist
+                if dist <= success_threshold:
+                    success_flag = True
 
-                writer.writerow([ep, t, reward, discount, x, y, theta, u, v, r,
-                                 goal_x, goal_y, xe, ye, dist, is_terminal, is_last])
+                writer.writerow(
+                    [ep, t, reward, discount, x, y, theta, u, v, r_val, goal_x, goal_y, xe, ye, dist, is_terminal, is_last]
+                )
 
                 if is_last:
-                    done = True
-                    final_dists.append(dist)
-                    if is_terminal:
-                        successes += 1
                     break
 
             ep_returns.append(ep_return)
-            ep_lengths.append(t)
+            ep_lengths.append(steps)
+            final_dists.append(final_dist)
+            if success_flag:
+                successes += 1
 
             if verbose:
-                print(f"[Episode {ep:03d}] return={ep_return:.2f} steps={t} "
-                      f"success={'Y' if done and traj['is_terminal'] else 'N'} "
-                      f"final_dist={final_dists[-1] if final_dists else float('nan'):.3f}")
+                status = "SUCCESS" if success_flag else "FAIL"
+                print(
+                    f"[Episode {ep:03d}] return={ep_return:.2f} steps={steps} "
+                    f"status={status} final_dist={final_dist:.3f}"
+                )
 
     metrics = {
         "episodes": episodes,
         "success_rate": successes / episodes if episodes else 0.0,
+        "success_count": successes,
         "avg_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
         "std_return": float(np.std(ep_returns)) if ep_returns else 0.0,
         "avg_ep_len": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
@@ -230,25 +314,55 @@ def evaluate_auv(
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--episodes", type=int, default=20)
-    p.add_argument("--dt", type=float, default=0.05)
-    p.add_argument("--max_steps", type=int, default=500)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out_csv", type=str, default="eval_trajectories.csv")
-    p.add_argument("--ckpt", type=str, default=None, help="DreamerV3 run dir (contains ckpt/ and config.yaml)")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Evaluate a CONTINUOUS-action policy in the AUV environment")
+    parser.add_argument("--ckpt", type=str, default=None, help="DreamerV3 run directory (contains ckpt/)")
+    parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes")
+    parser.add_argument("--dt", type=float, default=0.05, help="Environment integration step")
+    parser.add_argument("--max_steps", type=int, default=500, help="Maximum steps per episode")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for evaluation")
+    parser.add_argument(
+        "--success_threshold",
+        type=float,
+        default=0.1,  # match your env's success_radius default (0.1)
+        help="Distance (m) regarded as a successful reach (independent of is_terminal).",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="eval_outputs",
+        help="Directory to store evaluation CSV and summary",
+    )
+    parser.add_argument(
+        "--summary_json",
+        type=str,
+        default=None,
+        help="Optional path to save the aggregated metrics as JSON",
+    )
+    args = parser.parse_args()
 
-    policy = load_trained_policy(args.ckpt)
-    m = evaluate_auv(policy,
-                     episodes=args.episodes,
-                     dt=args.dt,
-                     max_steps=args.max_steps,
-                     out_csv=args.out_csv,
-                     seed=args.seed,
-                     verbose=True)
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "trajectories.csv"
+
+    metrics = evaluate_auv(
+        args.ckpt,
+        episodes=args.episodes,
+        dt=args.dt,
+        max_steps=args.max_steps,
+        success_threshold=args.success_threshold,
+        out_csv=csv_path,
+        seed=args.seed,
+        verbose=True,
+    )
+
+    if args.summary_json:
+        import json
+        summary_path = Path(args.summary_json).expanduser()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
+
     print("\n=== Evaluation Summary ===")
-    for k, v in m.items():
+    for k, v in metrics.items():
         print(f"{k}: {v}")
 
 
