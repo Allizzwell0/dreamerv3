@@ -253,11 +253,11 @@ def evaluate_auv(
     env = AUVEnv(
     dt=dt,
     max_steps=max_steps,
-    moving_goal=True,              # ⭐ 开启移动目标
-    goal_trajectory_type="circle", # 'circle' / 'line' / 'lemniscate'
-    goal_center=(10.0, 10.0),
-    goal_radius=3.0,
-    goal_speed=0.3,
+    moving_goal=True,             # ⭐ 开启移动目标
+    # goal_trajectory_type="circle", # 'circle' / 'line' / 'lemniscate'
+    # goal_center=(10.0, 10.0),
+    # goal_radius=3.0,
+    # goal_speed=0.3,
 )
 
 
@@ -378,10 +378,6 @@ def evaluate_auv(
 
                 ep_return += reward
                 final_dist = dist
-                EPS = 1e-6
-                if dist <= success_threshold + EPS:
-                    success_flag = True
-                    break
 
                 writer.writerow(
                     [
@@ -393,6 +389,10 @@ def evaluate_auv(
                     ]
                 )
 
+                EPS = 1e-6
+                if dist <= success_threshold + EPS:
+                    success_flag = True
+                    break
 
                 if is_last:
                     break

@@ -180,6 +180,31 @@ class Agent(embodied.jax.Agent):
       assert value.dtype == space.dtype, (key, space, value.dtype)
       target = f32(value) / 255 if isimage(space) else value
       losses[key] = recon.loss(sg(target))
+      # ====== 新增：world model 预测质量指标 ======
+      if key == 'vector':
+        # 1) 解码器的预测（形状大概是 [B, T, D]）
+        #   如果你的 Head 接口不是 .pred()，可以改成 recon.mode() / recon.dist.mean() 等
+        pred = recon.pred()
+
+        # 2) 计算每个时间步的 MSE：(B, T)
+        err = pred - target
+        mse_bt = jnp.mean(err ** 2, axis=-1)   # 对 feature 维度求平均
+
+        # 3) 计算 batch 标量：整体 MSE / RMSE
+        wm_mse = jnp.mean(mse_bt)              # 标量
+        wm_rmse = jnp.sqrt(wm_mse + 1e-8)
+
+        # 4) 也可以给一个“阈值准确率”：多少维误差 < eps
+        eps = 0.3  # 你可以自己调，比如 0.1、0.5 等
+        hit = (jnp.abs(err) < eps).astype(jnp.float32)
+        # 每个时间步的 feature 命中率 → 再对 B,T 平均
+        acc = jnp.mean(hit)
+
+        # 5) 写入 metrics（注意这里是 world model 的指标，不是 loss）
+        metrics['wm_mse_vec'] = wm_mse
+        metrics['wm_rmse_vec'] = wm_rmse
+        metrics['wm_acc_vec'] = acc
+      # ====== 新增部分结束 ======
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}

@@ -102,8 +102,8 @@ class AUVEnv(embodied.Env):
         moving_goal=True,
         goal_trajectory_type="circle",   # 'circle' / 'line' / 'lemniscate'
         goal_center=(10.0, 10.0),
-        goal_radius=3.0,
-        goal_speed=0.2,
+        goal_radius=6.0,
+        goal_speed=0.3,
         goal_custom_fn=None,             # 自定义：fn(t) -> (gx, gy)
         **kwargs,
     ):
@@ -116,7 +116,8 @@ class AUVEnv(embodied.Env):
         self.rudder_max = float(rudder_max)
 
         self.moving_goal = bool(moving_goal)
-        self.goal_trajectory_type = goal_trajectory_type
+        # self.goal_trajectory_type = np.random.choice(["circle", "line", "lemniscate"])
+        self.goal_trajectory_type = "line"
         self.goal_center = tuple(goal_center)
         self.goal_radius = float(goal_radius)
         self.goal_speed = float(goal_speed)
@@ -142,6 +143,8 @@ class AUVEnv(embodied.Env):
             return np.array([gx, gy], dtype=float)
 
         cx, cy = self.goal_center
+        # 随机改变self.goal_trajectory_type的值以测试不同轨迹
+        # self.goal_trajectory_type = self.np_random.choice(["circle", "line", "lemniscate"])
 
         if self.goal_trajectory_type == "circle":
             # 圆轨迹
