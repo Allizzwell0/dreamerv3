@@ -74,6 +74,24 @@ def update_model_state_kine(state, input, dt):
 def _wrap_pi(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
+def goal_in_body_frame(state_pos, goal):
+    """
+    state_pos: [x, y, theta] in world frame
+    goal: [gx, gy] in world frame
+    return: (x_b, y_b, dist) 目标在船体坐标系下的位置和距离
+    """
+    x, y, theta = state_pos
+    gx, gy = goal
+    dx = gx - x
+    dy = gy - y
+    c = math.cos(theta)
+    s = math.sin(theta)
+    # 世界 -> 船体
+    xb = c * dx + s * dy
+    yb = -s * dx + c * dy
+    dist = float(math.hypot(xb, yb))
+    return xb, yb, dist
+
 
 # ----------------- 连续动作 + 移动目标的 AUV 环境 -----------------
 class AUVEnv(embodied.Env):
@@ -105,6 +123,10 @@ class AUVEnv(embodied.Env):
         goal_radius=6.0,
         goal_speed=0.3,
         goal_custom_fn=None,             # 自定义：fn(t) -> (gx, gy)
+        energy_thrust_coef=1e-4,
+        energy_rudder_coef=1e-3,
+        smooth_ctrl_coef=1e-3,
+        smooth_vel_coef=1e-4, 
         **kwargs,
     ):
         del task, kwargs
@@ -116,12 +138,20 @@ class AUVEnv(embodied.Env):
         self.rudder_max = float(rudder_max)
 
         self.moving_goal = bool(moving_goal)
-        # self.goal_trajectory_type = np.random.choice(["circle", "line", "lemniscate"])
-        self.goal_trajectory_type = "line"
+        self.goal_trajectory_type = np.random.choice(["circle", "line", "lemniscate"])
+        # self.goal_trajectory_type = "line"
         self.goal_center = tuple(goal_center)
         self.goal_radius = float(goal_radius)
         self.goal_speed = float(goal_speed)
         self.goal_custom_fn = goal_custom_fn
+
+        self.energy_thrust_coef = float(energy_thrust_coef)
+        self.energy_rudder_coef = float(energy_rudder_coef)
+        self.smooth_ctrl_coef = float(smooth_ctrl_coef)
+        self.smooth_vel_coef = float(smooth_vel_coef)
+
+        self.prev_control = np.zeros(2, dtype=float)
+        self.prev_vel = np.zeros(3, dtype=float)
 
         self.steps = 0
         self.done = False
@@ -135,7 +165,7 @@ class AUVEnv(embodied.Env):
         self.time = 0.0
 
     # === 目标轨迹 ===
-    def _goal_traj(self, t):
+    def _goal_traj(self, t, steps):
         """根据时间 t 计算目标位置 (gx, gy)。"""
         # 若用户提供自定义轨迹，优先使用
         if self.goal_custom_fn is not None:
@@ -144,7 +174,8 @@ class AUVEnv(embodied.Env):
 
         cx, cy = self.goal_center
         # 随机改变self.goal_trajectory_type的值以测试不同轨迹
-        # self.goal_trajectory_type = self.np_random.choice(["circle", "line", "lemniscate"])
+        if steps % 20 == 0:
+            self.goal_trajectory_type = self.np_random.choice(["circle", "line", "lemniscate"])
 
         if self.goal_trajectory_type == "circle":
             # 圆轨迹
@@ -221,7 +252,7 @@ class AUVEnv(embodied.Env):
 
         # 移动目标：根据轨迹更新目标点
         if self.moving_goal:
-            self.goal = self._goal_traj(self.time)
+            self.goal = self._goal_traj(self.time, self.steps)
 
         # 动力学更新
         Xprop, deltar = self._parse_action(action)
@@ -229,34 +260,64 @@ class AUVEnv(embodied.Env):
         self.state_vel = update_model_state_dyn(self.state_vel, control, self.dt)
         self.state_pos = update_model_state_kine(self.state_pos, self.state_vel, self.dt)
 
-        # 误差与朝向
-        xe = self.state_pos[0] - self.goal[0]
-        ye = self.state_pos[1] - self.goal[1]
-        dist = float(np.hypot(xe, ye))
-        bearing = math.atan2(self.goal[1] - self.state_pos[1],
-                             self.goal[0] - self.state_pos[0])
-        heading_err = _wrap_pi(bearing - self.state_pos[2])
+                # === 误差：在船体坐标系下表示目标位置 ===
+        xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
-        # 轨迹相位 + 归一化时间（给世界模型“节奏感”）
+        # 轨迹相位 + 归一化时间
         phase = self.goal_speed * self.time
         phase_cos = math.cos(phase)
         phase_sin = math.sin(phase)
         t_norm = self.time / (self.max_steps * self.dt + 1e-6)
 
-        # 奖励（仍然是拦截型）
-        reward = -dist + self.w_heading * math.cos(heading_err)
+        # --- 跟踪 reward（原始） ---
+        eps = 1e-6
+        forward_cos = xb / (dist + eps)
+        track_reward = -dist + self.w_heading * forward_cos
 
+        # --- 能量惩罚（基于控制大小） ---
+        # 先归一化到 [-1,1] 再平方，数值更可控
+        norm_thrust = Xprop / (self.thrust_scale + eps)
+        norm_rudder = deltar / (self.rudder_max + eps)
+        energy_cost = (
+            self.energy_thrust_coef * norm_thrust**2 +
+            self.energy_rudder_coef * norm_rudder**2
+        )
+
+        # --- 控制平滑惩罚（基于控制变化） ---
+        dX = Xprop - self.prev_control[0]
+        dδ = deltar - self.prev_control[1]
+        norm_dX = dX / (self.thrust_scale + eps)
+        norm_dδ = dδ / (self.rudder_max + eps)
+        smooth_cost_ctrl = self.smooth_ctrl_coef * (norm_dX**2 + norm_dδ**2)
+
+        
+        du = self.state_vel[0] - self.prev_vel[0]
+        dv = self.state_vel[1] - self.prev_vel[1]
+        dr = self.state_vel[2] - self.prev_vel[2]
+        smooth_cost_vel = self.smooth_vel_coef * (du**2 + dv**2 + dr**2)
+
+        # --- 汇总 reward ---
+        reward = (
+            track_reward
+            - energy_cost
+            - smooth_cost_ctrl
+            - smooth_cost_vel
+        )
+
+        # === 到达判定：轨迹跟踪任务不再“追上就结束” ===
+        # success 可以保留，只用于 logging，不用于 done
         success = dist < self.success_radius
-        if success:
-            reward += 50.0
-            self.done = True   # 如果想持续跟踪，可以把这一行注释掉
 
         self.steps += 1
         if self.steps >= self.max_steps:
             self.done = True
 
+        # 更新 prev_* 供下一步使用
+        self.prev_control = control.copy()
+        self.prev_vel = self.state_vel.copy()
+
         obs = np.array([
-            xe, ye, dist,
+            xb, yb, dist,
             math.cos(self.state_pos[2]), math.sin(self.state_pos[2]),
             self.state_vel[0], self.state_vel[1], self.state_vel[2],
             self.state_pos[0], self.state_pos[1],
@@ -269,9 +330,10 @@ class AUVEnv(embodied.Env):
             vector=obs,
             reward=np.float32(reward),
             is_first=False,
-            is_last=self.done,
-            is_terminal=self.done,  # 如需区分“成功/超时”，可改为 is_terminal=success
+            is_last=self.done,     # 只在步数用完那步为 True
+            is_terminal=False,     # 轨迹跟踪视为持续任务
         )
+
 
     def _reset(self):
         self.steps = 0
@@ -286,6 +348,9 @@ class AUVEnv(embodied.Env):
         ], dtype=float)
         self.state_vel = np.zeros(3, dtype=float)
 
+        self.prev_control = np.zeros(2, dtype=float)
+        self.prev_vel = self.state_vel.copy()
+
         # 目标初始位置
         if self.moving_goal:
             self.goal = self._goal_traj(self.time)
@@ -295,9 +360,8 @@ class AUVEnv(embodied.Env):
                 self.np_random.uniform(8, 12),
             ], dtype=float)
 
-        xe = self.state_pos[0] - self.goal[0]
-        ye = self.state_pos[1] - self.goal[1]
-        dist = float(np.hypot(xe, ye))
+        # 船体坐标系下的初始误差
+        xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
         phase = self.goal_speed * self.time
         phase_cos = math.cos(phase)
@@ -305,7 +369,7 @@ class AUVEnv(embodied.Env):
         t_norm = 0.0
 
         obs = np.array([
-            xe, ye, dist,
+            xb, yb, dist,
             math.cos(self.state_pos[2]), math.sin(self.state_pos[2]),
             self.state_vel[0], self.state_vel[1], self.state_vel[2],
             self.state_pos[0], self.state_pos[1],
@@ -313,6 +377,7 @@ class AUVEnv(embodied.Env):
             phase_cos, phase_sin,
             t_norm,
         ], dtype=np.float32)
+
 
         return dict(
             vector=obs,
