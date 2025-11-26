@@ -155,9 +155,9 @@ size400m: &size400m
   .*\.units: 1536`
 
 size_auv: &size_auv
-  .*\.rssm: {deter: 1024, hidden: 128, classes: 8}
-  .*\.depth: 8
-  .*\.units: 256
+  .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
+  .*\.depth: 32
+  .*\.units: 512
 
 
 minecraft:

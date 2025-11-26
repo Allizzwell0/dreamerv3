@@ -15,7 +15,7 @@ python dreamerv3/main.py \
 目前评估函数写好，但之前训练模型与当前环境设计不匹配（加了导向角作为状态输入），故需要重新训练
 
 ```bash
-c
+python eval_auv.py   --ckpt /home/mayue/logdir/auv/{timestamp} --episodes 200 --out_dir /home/mayue/logdir/auv/{timestamp}/eval_output
 ```
 可能出现问题找不到checkpoint，需要debug
 

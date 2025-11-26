@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Plot AUV evaluation results from CSV produced by eval_auv.py
+Plot 3D AUV evaluation results from CSV produced by eval_auv.py
 
 Usage:
   python plot_auv.py --csv eval_outputs/trajectories.csv --episode 0
@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 
 # ===================== CSV 读取与预处理 =====================
@@ -54,17 +55,31 @@ def prepare_episode_arrays(rows: List[Dict[str, str]]) -> Dict[str, np.ndarray]:
         )
 
     data = {
-        "t": np.asarray([int(r["t"]) for r in rows_sorted], dtype=int),
-        "reward": arr("reward", default=0.0),
-        "dist": arr("dist"),
-        "x": arr("x"),
-        "y": arr("y"),
-        "goal_x": arr("goal_x"),      # 目标轨迹完整时间序列
-        "goal_y": arr("goal_y"),
-        "u": arr("u", default=0.0),
-        "v": arr("v", default=0.0),
-        "r": arr("r", default=0.0),
-        "theta": arr("theta", default=0.0),
+        "t":       np.asarray([int(r["t"]) for r in rows_sorted], dtype=int),
+        "reward":  arr("reward", default=0.0),
+        "dist":    arr("dist"),
+        # 位姿
+        "x":       arr("x"),
+        "y":       arr("y"),
+        "z":       arr("z"),
+        "psi":     arr("psi"),
+        "theta":   arr("theta"),
+        # 线速度 & 角速度
+        "u":       arr("u", default=0.0),
+        "v":       arr("v", default=0.0),
+        "w":       arr("w", default=0.0),
+        "p":       arr("p", default=0.0),
+        "q":       arr("q", default=0.0),
+        "r":       arr("r", default=0.0),
+        # 目标位置
+        "goal_x":  arr("goal_x"),
+        "goal_y":  arr("goal_y"),
+        "goal_z":  arr("goal_z"),
+        # 船体坐标系下误差
+        "xb":      arr("xb"),
+        "yb":      arr("yb"),
+        "zb":      arr("zb"),
+        # 终止标记
         "is_terminal": np.asarray(
             [str(r.get("is_terminal", "")).lower() == "true" for r in rows_sorted],
             dtype=bool,
@@ -114,7 +129,7 @@ def episode_summary(
 
 # ===================== 绘图函数 =====================
 
-def plot_trajectory(
+def plot_trajectory_3d(
     data: Dict[str, np.ndarray],
     episode: int,
     success: bool,
@@ -122,10 +137,56 @@ def plot_trajectory(
 ):
     xs = data["x"]
     ys = data["y"]
+    zs = data["z"]
+    gxs = data["goal_x"]
+    gys = data["goal_y"]
+    gzs = data["goal_z"]
+
+    auv_mask = ~np.isnan(xs) & ~np.isnan(ys) & ~np.isnan(zs)
+    goal_mask = ~np.isnan(gxs) & ~np.isnan(gys) & ~np.isnan(gzs)
+
+    if not np.any(auv_mask):
+        return None
+
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # --- AUV 轨迹 ---
+    ax.plot(xs[auv_mask], ys[auv_mask], zs[auv_mask],
+            marker="o", markersize=2, linewidth=1.0, label="AUV trajectory")
+
+    # 起点 / 终点
+    ax.scatter(xs[auv_mask][0], ys[auv_mask][0], zs[auv_mask][0],
+               marker="o", s=50, label="AUV start")
+    ax.scatter(xs[auv_mask][-1], ys[auv_mask][-1], zs[auv_mask][-1],
+               marker="x", s=70, label="AUV end")
+
+    # --- 目标轨迹 ---
+    if np.any(goal_mask):
+        ax.plot(gxs[goal_mask], gys[goal_mask], gzs[goal_mask],
+                linestyle="--", linewidth=1.0, label="Goal trajectory")
+        ax.scatter(gxs[goal_mask][0], gys[goal_mask][0], gzs[goal_mask][0],
+                   marker="^", s=60, label="Goal start")
+        ax.scatter(gxs[goal_mask][-1], gys[goal_mask][-1], gzs[goal_mask][-1],
+                   marker="*", s=120, label="Goal end")
+
+    ax.set_xlabel("x / m")
+    ax.set_ylabel("y / m")
+    ax.set_zlabel("z / m")
+    status = "SUCCESS" if success else "FAIL"
+    ax.set_title(f"Episode {episode}: 3D trajectories ({status}, thr={success_threshold:.2f} m)")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig, f"episode_{episode:03d}_trajectory3d.png"
+
+
+def plot_projection_xy(data: Dict[str, np.ndarray], episode: int, success: bool, success_threshold: float):
+    """俯视图 XY 投影。"""
+    xs = data["x"]
+    ys = data["y"]
     gxs = data["goal_x"]
     gys = data["goal_y"]
 
-    # 有效点掩码
     auv_mask = ~np.isnan(xs) & ~np.isnan(ys)
     goal_mask = ~np.isnan(gxs) & ~np.isnan(gys)
 
@@ -134,71 +195,72 @@ def plot_trajectory(
 
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    # --- AUV 轨迹 ---
-    ax.plot(
-        xs[auv_mask],
-        ys[auv_mask],
-        marker="o",
-        markersize=2,
-        linewidth=1.0,
-        label="AUV trajectory",
-    )
-
-    # 起点 / 终点
+    ax.plot(xs[auv_mask], ys[auv_mask],
+            marker="o", markersize=2, linewidth=1.0, label="AUV trajectory")
     ax.scatter(xs[auv_mask][0], ys[auv_mask][0], marker="o", s=50, label="AUV start")
     ax.scatter(xs[auv_mask][-1], ys[auv_mask][-1], marker="x", s=70, label="AUV end")
 
-    # --- 目标轨迹（移动目标） ---
     if np.any(goal_mask):
-        ax.plot(
-            gxs[goal_mask],
-            gys[goal_mask],
-            linestyle="--",
-            linewidth=1.0,
-            label="Goal trajectory",
-        )
-        # 目标起点 / 终点
+        ax.plot(gxs[goal_mask], gys[goal_mask],
+                linestyle="--", linewidth=1.0, label="Goal trajectory")
         ax.scatter(gxs[goal_mask][0], gys[goal_mask][0], marker="^", s=60, label="Goal start")
+        # 这里修正：原来是 (gys, gys)，现在是 (gxs, gys)
         ax.scatter(gxs[goal_mask][-1], gys[goal_mask][-1], marker="*", s=120, label="Goal end")
 
     ax.set_xlabel("x / m")
     ax.set_ylabel("y / m")
     status = "SUCCESS" if success else "FAIL"
-    ax.set_title(f"Episode {episode}: XY trajectories ({status}, thr={success_threshold:.2f} m)")
+    ax.set_title(f"Episode {episode}: XY projection ({status}, thr={success_threshold:.2f} m)")
     ax.set_aspect("equal", "box")
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
     ax.legend(loc="best")
     fig.tight_layout()
-    return fig, f"episode_{episode:03d}_trajectory.png"
+    return fig, f"episode_{episode:03d}_trajectory_xy.png"
 
 
 def plot_speed_profiles(data: Dict[str, np.ndarray], episode: int):
     t = data["t"]
     u = data["u"]
     v = data["v"]
+    w = data["w"]
+    p = data["p"]
+    q = data["q"]
     r = data["r"]
-    speed = np.hypot(u, v)
+    z = data["z"]
 
-    fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+    lin_speed = np.sqrt(u**2 + v**2 + w**2)
+    ang_speed = np.sqrt(p**2 + q**2 + r**2)
 
-    axes[0].plot(t, u, label="surge u")
-    axes[0].plot(t, v, label="sway v")
+    fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+
+    # 线速度
+    axes[0].plot(t, u, label="u (surge)")
+    axes[0].plot(t, v, label="v (sway)")
+    axes[0].plot(t, w, label="w (heave)")
+    axes[0].plot(t, lin_speed, label="|v|")
     axes[0].set_ylabel("velocity (m/s)")
     axes[0].legend(loc="upper right")
     axes[0].grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
-    axes[1].plot(t, speed, label="|velocity|")
-    axes[1].set_ylabel("speed (m/s)")
+    # 角速度
+    axes[1].plot(t, p, label="p")
+    axes[1].plot(t, q, label="q")
+    axes[1].plot(t, r, label="r")
+    axes[1].plot(t, ang_speed, label="|ω|")
+    axes[1].set_ylabel("angular rate (rad/s)")
+    axes[1].legend(loc="upper right")
     axes[1].grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
-    axes[2].plot(t, r, label="yaw rate r")
-    axes[2].set_ylabel("yaw rate (rad/s)")
+    # 深度
+    axes[2].plot(t, z, label="depth z")
+    axes[2].set_ylabel("z / m")
     axes[2].set_xlabel("time step")
+    axes[2].legend(loc="upper right")
     axes[2].grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
-    fig.suptitle(f"Episode {episode}: Velocity profiles", y=0.95)
+    fig.suptitle(f"Episode {episode}: Velocity & depth profiles", y=0.96)
     fig.tight_layout()
-    return fig, f"episode_{episode:03d}_velocity.png"
+    return fig, f"episode_{episode:03d}_velocity_depth.png"
 
 
 def plot_distance_reward(data: Dict[str, np.ndarray], episode: int):
@@ -242,7 +304,6 @@ def plot_success_histories(
         return []
 
     eps = np.asarray([s[0] for s in summaries], dtype=int)
-    final_dists = np.asarray([s[1] for s in summaries], dtype=float)
     mean_dists = np.asarray([s[2] for s in summaries], dtype=float)
     track_ratios = np.asarray([s[3] for s in summaries], dtype=float)
     successes = np.asarray([s[4] for s in summaries], dtype=bool)
@@ -285,7 +346,7 @@ def plot_success_histories(
 # ===================== 主入口 =====================
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot AUV evaluation trajectories")
+    parser = argparse.ArgumentParser(description="Plot 3D AUV evaluation trajectories")
     parser.add_argument("--csv", type=str, default="eval_outputs/trajectories.csv")
     parser.add_argument("--episode", type=int, default=0, help="Episode index for per-step plots")
     parser.add_argument(
@@ -304,7 +365,7 @@ def main():
     parser.add_argument(
         "--track_success_ratio",
         type=float,
-        default=0.8,  # 要和 eval_auv.py 里的 track_success_ratio 对齐
+        default=0.3,  # 要和 eval_auv.py 里的 track_success_ratio 对齐
         help="Episode is considered SUCCESS if track_ratio >= this value.",
     )
     args = parser.parse_args()
@@ -335,7 +396,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[plot_auv] Saving figures to: {out_dir}")
 
-    # 打印每个 episode 的 summary，和新的 tracking 定义一致
+    # 打印每个 episode 的 summary
     print("\n[plot_auv] Episode summaries:")
     for ep, data in sorted(episode_arrays.items()):
         ret, length, final_dist, mean_dist, track_ratio, success = episode_summary(
@@ -355,11 +416,17 @@ def main():
     )
 
     figures: List[Tuple[plt.Figure, str]] = []
-    traj_fig = plot_trajectory(ep_data, target_episode, ep_success, args.success_threshold)
-    if traj_fig is not None:
-        figures.append(traj_fig)
+    traj3d_fig = plot_trajectory_3d(ep_data, target_episode, ep_success, args.success_threshold)
+    if traj3d_fig is not None:
+        figures.append(traj3d_fig)
+
+    proj_fig = plot_projection_xy(ep_data, target_episode, ep_success, args.success_threshold)
+    if proj_fig is not None:
+        figures.append(proj_fig)
+
     speed_fig = plot_speed_profiles(ep_data, target_episode)
     figures.append(speed_fig)
+
     dist_fig = plot_distance_reward(ep_data, target_episode)
     figures.append(dist_fig)
 

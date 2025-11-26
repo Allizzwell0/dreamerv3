@@ -1,386 +1,765 @@
-import numpy as np
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+6DOF REMUS AUV 环境（DreamerV3 / embodied.Env 风格）
+
+状态:
+  位置姿态 η = [x, y, z, phi, theta, psi]   (NED/世界坐标系)
+  速度     ν = [u, v, w, p, q, r]           (船体系)
+
+动作（连续）: 3 维
+  action[0] : 纵向推进器推力   T_prop   [-1, 1] -> [-T_max, T_max] N
+  action[1] : 方向舵偏角       δ_r     [-1, 1] -> [-δ_r_max, δ_r_max] rad
+  action[2] : 尾平面舵偏角     δ_s     [-1, 1] -> [-δ_s_max, δ_s_max] rad
+
+观测:
+  vector (float32, 1D, 30 维):
+    [0:4]   目标在船体系误差 e_b = [x_b, y_b, z_b, dist]
+    [4:10]  姿态编码 [cos φ, sin φ, cos θ, sin θ, cos ψ, sin ψ]
+    [10:16] 速度 ν = [u, v, w, p, q, r]
+    [16:22] 位置 [x, y, z] + 目标位置 [gx, gy, gz] （世界系）
+    [22:28] 轨迹相位编码 phase_cos/sin_xyz （3 个相位的 cos/sin）
+    [28:30] 归一化时间 [t_norm, seg_phase] （整个 episode + 当前段相位）
+
+说明：
+  - 水动力系数按 Prestero(2001) / Table 12 命名。
+"""
+
+from __future__ import annotations
+
 import math
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
 import elements
 import embodied
 
-# ----------------- 动力学 / 运动学模型 -----------------
-def update_model_state_dyn(state, input, dt):
-    Xuu = -1.62e0
-    Nvv = -3.18e0
-    Yvv = -1.31e0
-    Yrr = 6.32e-1
-    Nrr = -9.4e+1
-    Xu = -9.4e-1
-    Yv = -3.55e+1
-    Nv = 1.93e0
-    Nr = -4.88e0
-    Xvr = 3.55e+1
-    Xrr = -1.93e0
-    Yur = 5.22e0
-    Nur = -2e0
-    Yuv = -2.86e+1
-    Yuudr = 9.64e0
-    Nuudr = -6.15e0
 
-    Yr = 1.93e0
-    Nuv = -2.4e1
+# ============== 一些小工具 ==============
 
-    m = 30.51e0
-    Iz = 3.45e0
-    xg = 0
-    yg = 0
-
-    Xprop, deltar = input
-    u, v, r = state
-
-    # 限幅
-    u = np.clip(u, -5, 5)
-    v = np.clip(v, -5, 5)
-    r = np.clip(r, -3, 3)
-    deltar = np.clip(deltar, -0.6, 0.6)
-    Xprop = np.clip(Xprop, -50, 50)
-
-    M = np.array([
-        [m - Xu, 0, -m * yg],
-        [0, m - Yv, m * xg - Yr],
-        [-m * yg, m * xg - Nv, Iz - Nr],
-    ])
-
-    tau = np.array([
-        [Xuu * abs(u) * u + Xvr * v * r + Xrr * r * r + Xprop + m * v * r + m * xg * r * r],
-        [Yvv * abs(v) * v + Yrr * abs(r) * r + Yur * u * r + Yuv * u * v + Yuudr * u * u * deltar - m * (u * r - yg * r * r)],
-        [Nvv * abs(v) * v + Nrr * abs(r) * r + Nur * u * r + Nuv * u * v + Nuudr * u * u * deltar - m * (xg * u * r + yg * v * r)],
-    ])
-
-    accel = np.linalg.inv(M) @ tau
-    accel = np.clip(accel, -100, 100)
-
-    new_state = np.array([u, v, r]) + accel.flatten() * dt
-    new_state = np.clip(new_state, -10, 10)
-    return new_state
+def _wrap_pi(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 
-def update_model_state_kine(state, input, dt):
-    u, v, r = input
-    x, y, theta = state
+def _rot_bn(phi: float, theta: float, psi: float) -> np.ndarray:
+    """从 body 到 world 的旋转矩阵 R_bn (Z-Y-X: yaw-pitch-roll)."""
+    cphi, sphi = math.cos(phi), math.sin(phi)
+    cth,  sth  = math.cos(theta), math.sin(theta)
+    cpsi, spsi = math.cos(psi), math.sin(psi)
 
-    x += (np.cos(theta) * u - np.sin(theta) * v) * dt
-    y += (np.sin(theta) * u + np.cos(theta) * v) * dt
-    theta += r * dt
-    theta = (theta + np.pi) % (2 * np.pi) - np.pi
-    return np.array([x, y, theta])
+    # R_bn = R_z(psi) * R_y(theta) * R_x(phi)
+    R = np.array([
+        [ cpsi*cth,  cpsi*sth*sphi - spsi*cphi,  cpsi*sth*cphi + spsi*sphi],
+        [ spsi*cth,  spsi*sth*sphi + cpsi*cphi,  spsi*sth*cphi - cpsi*sphi],
+        [   -sth,                cth*sphi,                cth*cphi      ],
+    ], dtype=float)
+    return R
 
 
-def _wrap_pi(a):
-    return (a + np.pi) % (2 * np.pi) - np.pi
+def _euler_kinematics(phi: float, theta: float, p: float, q: float, r: float) -> np.ndarray:
+    """[phi_dot, theta_dot, psi_dot] = T(φ,θ) * [p,q,r]."""
+    cphi, sphi = math.cos(phi), math.sin(phi)
+    cth,  sth  = math.cos(theta), math.sin(theta)
 
-def goal_in_body_frame(state_pos, goal):
+    if abs(cth) < 1e-6:
+        cth = 1e-6
+
+    tth  = sth / cth
+
+    T = np.array([
+        [1.0,  sphi * tth,           cphi * tth],
+        [0.0,       cphi,               -sphi ],
+        [0.0,  sphi / cth,           cphi / cth],
+    ], dtype=float)
+    return T @ np.array([p, q, r], dtype=float)
+
+
+def goal_in_body_frame(eta_pos: np.ndarray, goal: np.ndarray) -> Tuple[float, float, float, float]:
     """
-    state_pos: [x, y, theta] in world frame
-    goal: [gx, gy] in world frame
-    return: (x_b, y_b, dist) 目标在船体坐标系下的位置和距离
+    把目标位置从世界系转换到船体系.
+    eta_pos: [x, y, z, phi, theta, psi]
+    goal:    [gx, gy, gz] (world)
+    return: (x_b, y_b, z_b, dist)
     """
-    x, y, theta = state_pos
-    gx, gy = goal
-    dx = gx - x
-    dy = gy - y
-    c = math.cos(theta)
-    s = math.sin(theta)
-    # 世界 -> 船体
-    xb = c * dx + s * dy
-    yb = -s * dx + c * dy
-    dist = float(math.hypot(xb, yb))
-    return xb, yb, dist
+    x, y, z, phi, theta, psi = eta_pos
+    gx, gy, gz = goal
+    dx, dy, dz = gx - x, gy - y, gz - z
+    R_bn = _rot_bn(phi, theta, psi)
+    e_b = R_bn.T @ np.array([dx, dy, dz], dtype=float)
+    dist = float(np.linalg.norm(e_b))
+    return float(e_b[0]), float(e_b[1]), float(e_b[2]), dist
 
 
-# ----------------- 连续动作 + 移动目标的 AUV 环境 -----------------
-class AUVEnv(embodied.Env):
+# ============== REMUS 6DOF 动力学参数 ==============
+
+@dataclass
+class RemusParams:
     """
-    AUV 3自由度（x, y, ψ）+ 动力学模型环境（连续动作）
+    系数字段尽量与 Prestero(2001) 保持一致。
+    """
 
-    action: shape=(2,), float32, 范围[-1, 1]
-      action[0] -> 相对推力（-1~1），内部映射到 [-thrust_scale, +thrust_scale] N
-      action[1] -> 相对舵角（-1~1），内部映射到 [-rudder_max, +rudder_max] rad
+    # 基本质量 / 重力 / 浮力
+    W: float = 299.0
+    B: float = 306.0
+    m: float = 30.45
 
-    支持静态目标 + 移动目标：
-      - moving_goal=False: 目标是随机静止点（你原来的设定）
-      - moving_goal=True : 目标按指定轨迹移动
+    x_g: float = 0.0
+    y_g: float = 0.0
+    z_g: float = 0.0196
+
+    x_b: float = 0.0
+    y_b: float = 0.0
+    z_b: float = 0.0
+
+    Ixx: float = 0.177
+    Iyy: float = 3.45
+    Izz: float = 3.45
+
+    # --- Added mass (dot)  未知项先置 0 ---
+    X_du: float = -0.93   # X_{dot u}  
+    Y_dv: float = -35.5   # Y_{dot v}  
+    Y_dr: float = 1.93   # Y_{dot r}  
+    Z_dw: float = -35.5   # Z_{dot w}  
+    Z_dq: float = -1.93 # Z_{dot q}
+    K_dp: float = -0.0704   # K_{dot p}  
+    M_dw: float = -1.93 # M_{dot w}
+    M_dq: float = -4.88 # M_{dot q}
+    N_dv: float = 1.93   # N_{dot v} 
+    N_dr: float = -4.88   # N_{dot r}  
+
+    # --- Surge 相关导数 ---
+    Xu: float    = -0.94   # 线性项，如需可自己加到 X_rhs 里
+    Xuabs: float = -3.90   # X_{u|u|}  (表中 Xuu)
+    Xwq: float   = -35.5   # X_{wq} (近似来自 Xuvq)
+    Xqq: float   = -1.93   # X_{qq}
+    Xvr: float   = 35.5    # X_{vr}
+    Xrr: float   = -1.93   # X_{rr}
+
+    # --- Sway 相关导数 ---
+    Yv: float    = -35.5
+    Yvabs: float = -1310.0 # Y_{v|v|}
+    Yr: float    = 1.93
+    Yrabs: float = 0.632   # Y_{r|r|}
+    Yur: float   = 5.22
+    Ywp: float   = 35.5    # 由 Yvp 近似
+    Ypq: float   = 1.93
+    Yuv: float   = -28.6
+    Yuudr: float = 9.64    # Y_{u^2 δ_r}
+
+    # --- Heave 相关导数 ---
+    Zw: float    = -1310.0
+    Zwabs: float = -1310.0 # Z_{w|w|}
+    Zqabs: float = -0.632  # Z_{q|q|}
+    Zuq: float   = -5.22   # 来自 Zwq
+    Zvp: float   = -35.5
+    Zrp: float   = 1.93
+    Zuw: float   = -28.6
+    Zuuds: float = -9.64     # Z_{u^2 δ_s}  参看论文
+
+    # --- Roll 相关导数 ---
+    Kpp: float   = -0.13   # K_{p|p|}
+    K_prop_gain: float = 0.0  # 螺旋桨扭矩对 K 的贡献 不考虑扭矩设为0
+
+    # --- Pitch 相关导数 ---
+    Mww: float   = 3.18
+    Mqq: float   = -188.0
+    Muq: float   = -2.00     
+    Mvp: float   = -1.93
+    Mrp: float   = 4.86
+    Muw: float   = 24.0
+    Muuds: float = -6.15     # M_{u^2 δ_s} 
+
+    # --- Yaw 相关导数 ---
+    Nvabs: float = -3.18   # N_{v|v|}
+    Nr: float    = -4.88
+    Nrr: float   = -94.0
+    Nur: float   = -2.0
+    Npq: float   = -4.86
+    Nuv: float   = -24.0     
+    Nwp: float   = -1.93     
+    Nuudr: float = -6.15   # N_{u^2 δ_r}
+
+    # --- 推进器 + 舵面控制 ---
+    X_prop_gain: float = 1.0  # X_prop = gain * T_prop
+
+
+# ============== 静水力 ==============
+
+def hydrostatic_forces(p: RemusParams, phi: float, theta: float) -> np.ndarray:
+    cphi, sphi = math.cos(phi), math.sin(phi)
+    cth, sth = math.cos(theta), math.sin(theta)
+
+    W, B = p.W, p.B
+
+    X_HS = -(W - B) * sth
+    Y_HS = (W - B) * cth * sphi
+    Z_HS = (W - B) * cth * cphi
+
+    K_HS = -((p.y_g * W - p.y_b * B) * cth * cphi +
+             (p.z_g * W - p.z_b * B) * cth * sphi)
+    M_HS = -((p.z_g * W - p.z_b * B) * sth +
+             (p.x_g * W - p.x_b * B) * cth * cphi)
+    N_HS = -((p.x_g * W - p.x_b * B) * cth * sphi +
+             (p.y_g * W - p.y_b * B) * sth)
+
+    return np.array([X_HS, Y_HS, Z_HS, K_HS, M_HS, N_HS], dtype=float)
+
+
+# ============== 6DOF 动力学积分（使用上面公式） ==============
+
+def remus_dynamics_step(
+    params: RemusParams,
+    eta: np.ndarray,
+    nu: np.ndarray,
+    control_forces: np.ndarray,
+    dt: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    根据给出的 6DOF REMUS 标量方程构造：
+      A * nu_dot = b
+    其中 b 包含水静力 + 阻尼 + 交叉项 + 控制 (control_forces = tau)。
+    为了保持数值稳定，A 目前只用了对角项（附加质量未知为 0）。
+    """
+
+    p = params
+    tau = control_forces
+    m = p.m
+
+    # 当前状态
+    u, v, w, p_ang, q, r = nu
+    phi, theta, psi = eta[3:6]
+
+    # 静水力
+    X_HS, Y_HS, Z_HS, K_HS, M_HS, N_HS = hydrostatic_forces(p, phi, theta)
+
+    # --- 右端项 b（对应 6 个标量方程） ---
+
+    # Surge
+    X_rhs = (
+        X_HS
+        + p.Xuabs * u * abs(u)
+        + (p.Xwq - m) * w * q
+        + (p.Xqq + m * p.x_g) * q * q
+        + (p.Xvr + m) * v * r
+        + (p.Xrr + m * p.x_g) * r * r
+        - m * p.y_g * p_ang * q
+        - m * p.z_g * p_ang * r
+        + tau[0]
+    )
+
+    # Sway
+    Y_rhs = (
+        Y_HS
+        + p.Yvabs * v * abs(v)
+        + p.Yrabs * r * abs(r)
+        + (p.Yur - m) * u * r
+        + (p.Ywp + m) * w * p_ang
+        + (p.Ypq - m * p.x_g) * p_ang * q
+        + p.Yuv * u * v
+        + tau[1]
+    )
+
+    # Heave
+    Z_rhs = (
+        Z_HS
+        + p.Zwabs * w * abs(w)
+        + p.Zqabs * q * abs(q)
+        + (p.Zuq + m) * u * q
+        + (p.Zvp - m) * v * p_ang
+        + (p.Zrp - m * p.x_g) * r * p_ang
+        + p.Zuw * u * w
+        + tau[2]
+    )
+
+    # Roll
+    K_rhs = (
+        K_HS
+        + p.Kpp * p_ang * abs(p_ang)
+        - (p.Izz - p.Iyy) * q * r
+        + tau[3]
+    )
+
+    # Pitch
+    M_rhs = (
+        M_HS
+        + p.Mww * w * abs(w)
+        + p.Mqq * q * abs(q)
+        + (p.Muq - m * p.x_g) * u * q
+        + (p.Mvp + m * p.x_g) * v * p_ang
+        + (p.Mrp - (p.Ixx - p.Izz)) * r * p_ang
+        + p.Muw * u * w
+        + tau[4]
+    )
+
+    # Yaw
+    N_rhs = (
+        N_HS
+        + p.Nvabs * v * abs(v)
+        + p.Nrr * r * abs(r)
+        + (p.Nur - m * p.x_g) * u * r
+        + (p.Npq - (p.Iyy - p.Ixx)) * p_ang * q
+        + p.Nuv * u * v
+        + tau[5]
+    )
+
+    b = np.array([X_rhs, Y_rhs, Z_rhs, K_rhs, M_rhs, N_rhs], dtype=float)
+
+    # --- A 矩阵：加速度系数（目前只保留对角） ---
+    A = np.zeros((6, 6), dtype=float)
+    A[0, 0] = m - p.X_du
+    A[1, 1] = m - p.Y_dv
+    A[2, 2] = m - p.Z_dw
+    A[3, 3] = p.Ixx - p.K_dp
+    A[4, 4] = p.Iyy - p.M_dq
+    A[5, 5] = p.Izz - p.N_dr
+
+    # 解 nu_dot
+    try:
+        nu_dot = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        # 如果 A 奇异，就退化成对角除法
+        diag = np.diag(A)
+        diag[diag == 0.0] = 1.0
+        nu_dot = b / diag
+
+    nu_dot = np.clip(nu_dot, -50.0, 50.0)
+    nu_new = nu + nu_dot * dt
+
+    # 运动学积分：eta_dot = [R_bn v; T(φ,θ) ω]
+    R_bn = _rot_bn(phi, theta, psi)
+    vel_world = R_bn @ np.array([nu_new[0], nu_new[1], nu_new[2]], dtype=float)
+    euler_dot = _euler_kinematics(phi, theta, nu_new[3], nu_new[4], nu_new[5])
+
+    eta_dot = np.concatenate([vel_world, euler_dot])
+    eta_new = eta + eta_dot * dt
+
+    eta_new[3] = _wrap_pi(eta_new[3])
+    eta_new[4] = _wrap_pi(eta_new[4])
+    eta_new[5] = _wrap_pi(eta_new[5])
+
+    return eta_new, nu_new
+
+
+class Trajectory3D:
+    """
+    提供多种 3D 轨迹，但与之前不同的是：
+      - 一个 Trajectory3D 实例在构造时随机确定轨迹类型和参数；
+      - 整个生命周期都沿着同一条平滑曲线运动（不再分段重采样）；
+      - 用一个较小的 speed，使目标点移动更慢、更容易跟踪。
     """
 
     def __init__(
         self,
+        center=(10.0, 10.0, -5.0),
+        radius=6.0,
+        speed=0.2,  # 比原来的 0.3 慢一些
+        rng: np.random.RandomState | None = None,
+    ):
+        self.center = np.array(center, dtype=float)
+        self.radius = float(radius)
+        self.speed = float(speed)
+
+        # 让 env 传进来的 rng 控制随机性；如果没有就自己创建一个
+        self.rng = rng if rng is not None else np.random.RandomState()
+
+        # 随机决定本 episode 使用哪一类轨迹
+        self.current_type = self.rng.choice(
+            ["line3d", "circle3d", "helix3d", "lemniscate3d"]
+        )
+
+        # 记录“起始时间”和“周期长度”，便于 env 里算 seg_phase
+        self.seg_start_t = 0.0
+
+        # 下面这个 seg_duration 只用来给 obs 里面的 seg_phase 归一化，
+        # 不再触发重新采样，因此设成一个“轨迹周期”的量级即可。
+        a = max(self.radius, 1e-3)
+        w = self.speed / a      # 角速度
+        T = 2.0 * math.pi / max(w, 1e-6)   # 绕一圈的时间
+        self.seg_duration = T             # 一圈时间作为 “一段”的时间
+
+        # 存放该条轨迹需要的参数
+        self.seg_params: Dict[str, np.ndarray] = {}
+        self._init_params()
+
+    def _init_params(self):
+        """根据 current_type 随机初始化一次轨迹参数。"""
+        cx, cy, cz = self.center
+        a = self.radius
+
+        if self.current_type == "line3d":
+            # 起点 & 方向，整条轨迹就是一条无限直线
+            p0 = self.center + self.rng.uniform(-a, a, size=3)
+            direction = self.rng.normal(size=3)
+            direction[2] *= 0.3  # 垂直方向不要太猛
+            direction /= (np.linalg.norm(direction) + 1e-6)
+            self.seg_params = dict(p0=p0, direction=direction)
+
+        elif self.current_type == "circle3d":
+            # 水平圆轨迹，深度固定一个值
+            depth = cz + self.rng.uniform(-a / 3, a / 3)
+            phase0 = float(self.rng.uniform(0.0, 2.0 * math.pi))
+            self.seg_params = dict(depth=depth, phase0=phase0)
+
+        elif self.current_type == "helix3d":
+            # 水平圆 + 缓慢上下波动（螺旋）
+            depth0 = cz + self.rng.uniform(-a / 3, a / 3)
+            depth_amp = a / 3
+            phase0 = float(self.rng.uniform(0.0, 2.0 * math.pi))
+            self.seg_params = dict(depth0=depth0, depth_amp=depth_amp, phase0=phase0)
+
+        elif self.current_type == "lemniscate3d":
+            # 3D "∞" 形轨迹，深度固定
+            depth = cz + self.rng.uniform(-a / 3, a / 3)
+            phase0 = float(self.rng.uniform(0.0, 2.0 * math.pi))
+            self.seg_params = dict(depth=depth, phase0=phase0)
+
+        else:
+            # 理论上不会走到这里
+            self.seg_params = {}
+
+    def __call__(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        返回 (position, phase_vec)
+          position: [gx, gy, gz]
+          phase_vec: [phase_x, phase_y, phase_z] 供 obs 编码
+        整个 episode 内不会重采样参数，因此轨迹是单条平滑曲线。
+        """
+        dt = t - self.seg_start_t
+        a = self.radius
+        w = self.speed / max(a, 1e-3)
+
+        cx, cy, cz = self.center
+
+        if self.current_type == "line3d":
+            p0 = self.seg_params["p0"]
+            direction = self.seg_params["direction"]
+            pos = p0 + direction * self.speed * dt
+            phase = np.array([w * dt, 0.0, 0.0], dtype=float)
+
+        elif self.current_type == "circle3d":
+            depth = self.seg_params["depth"]
+            phase0 = self.seg_params["phase0"]
+            ang = w * dt + phase0
+            pos = np.array([
+                cx + a * math.cos(ang),
+                cy + a * math.sin(ang),
+                depth,
+            ], dtype=float)
+            phase = np.array([ang, 0.0, 0.0], dtype=float)
+
+        elif self.current_type == "helix3d":
+            depth0 = self.seg_params["depth0"]
+            depth_amp = self.seg_params["depth_amp"]
+            phase0 = self.seg_params["phase0"]
+            ang = w * dt + phase0
+            pos = np.array([
+                cx + a * math.cos(ang),
+                cy + a * math.sin(ang),
+                depth0 + depth_amp * math.sin(ang * 0.5),  # 垂向变化再慢一点
+            ], dtype=float)
+            phase = np.array([ang, ang * 0.5, 0.0], dtype=float)
+
+        elif self.current_type == "lemniscate3d":
+            depth = self.seg_params["depth"]
+            phase0 = self.seg_params["phase0"]
+            ang = w * dt + phase0
+            s = math.sin(ang)
+            c = math.cos(ang)
+            pos = np.array([
+                cx + a * s,
+                cy + a * s * c,
+                depth,
+            ], dtype=float)
+            phase = np.array([ang, 2.0 * ang, 0.0], dtype=float)
+
+        else:
+            pos = self.center.copy()
+            phase = np.zeros(3, dtype=float)
+
+        return pos, phase
+
+
+# ============== 6DOF REMUS 环境 ==============
+
+class AUVEnv(embodied.Env):
+    def __init__(
+        self,
         task=None,
-        dt=0.05,
-        max_steps=500,
-        success_radius=1.0,
-        w_heading=0.2,
-        thrust_scale=50.0,
-        rudder_max=0.6,
-        # === 新增：移动目标相关参数 ===
-        moving_goal=True,
-        goal_trajectory_type="circle",   # 'circle' / 'line' / 'lemniscate'
-        goal_center=(10.0, 10.0),
-        goal_radius=6.0,
-        goal_speed=0.3,
-        goal_custom_fn=None,             # 自定义：fn(t) -> (gx, gy)
-        energy_thrust_coef=1e-4,
-        energy_rudder_coef=1e-3,
-        smooth_ctrl_coef=1e-3,
-        smooth_vel_coef=1e-4, 
+        dt: float = 0.05,
+        max_steps: int = 1000,
+        success_radius: float = 1.0,
+        w_align: float = 1.0,
+        thrust_scale: float = 50.0,
+        rudder_max: float = 0.6,
+        stern_max: float = 0.6,
+        # ==== 新增 / 调整的奖励相关系数 ====
+        dist_coef: float = 2.0,      # 总距离平方惩罚权重
+        lat_coef: float = 1.0,       # y_b, z_b 侧向/垂向误差惩罚权重
+        heading_coef: float = 0.5,   # 航向/俯仰误差惩罚权重
+        # 能量 & 平滑：先调小一点，便于先学精确跟踪
+        energy_thrust_coef: float = 1e-5,
+        energy_surface_coef: float = 1e-4,
+        smooth_ctrl_coef: float = 1e-4,
+        smooth_vel_coef: float = 1e-5,
         **kwargs,
     ):
         del task, kwargs
         self.dt = float(dt)
         self.max_steps = int(max_steps)
         self.success_radius = float(success_radius)
-        self.w_heading = float(w_heading)
+        self.w_align = float(w_align)
+
         self.thrust_scale = float(thrust_scale)
         self.rudder_max = float(rudder_max)
+        self.stern_max = float(stern_max)
 
-        self.moving_goal = bool(moving_goal)
-        self.goal_trajectory_type = np.random.choice(["circle", "line", "lemniscate"])
-        # self.goal_trajectory_type = "line"
-        self.goal_center = tuple(goal_center)
-        self.goal_radius = float(goal_radius)
-        self.goal_speed = float(goal_speed)
-        self.goal_custom_fn = goal_custom_fn
+        self.params = RemusParams()
 
+        # 跟踪精度相关权重
+        self.dist_coef = float(dist_coef)
+        self.lat_coef = float(lat_coef)
+        self.heading_coef = float(heading_coef)
+
+        # 能量 & 平滑代价权重
         self.energy_thrust_coef = float(energy_thrust_coef)
-        self.energy_rudder_coef = float(energy_rudder_coef)
+        self.energy_surface_coef = float(energy_surface_coef)
         self.smooth_ctrl_coef = float(smooth_ctrl_coef)
         self.smooth_vel_coef = float(smooth_vel_coef)
 
-        self.prev_control = np.zeros(2, dtype=float)
-        self.prev_vel = np.zeros(3, dtype=float)
-
         self.steps = 0
         self.done = False
-        self.np_random = np.random.RandomState(0)
-
-        self.state_pos = np.zeros(3)   # [x, y, theta]
-        self.state_vel = np.zeros(3)   # [u, v, r]
-        self.goal = np.zeros(2)
-
-        # 时间，用于移动目标的“动力学/轨迹”
         self.time = 0.0
 
-    # === 目标轨迹 ===
-    def _goal_traj(self, t, steps):
-        """根据时间 t 计算目标位置 (gx, gy)。"""
-        # 若用户提供自定义轨迹，优先使用
-        if self.goal_custom_fn is not None:
-            gx, gy = self.goal_custom_fn(t)
-            return np.array([gx, gy], dtype=float)
+        self.np_random = np.random.RandomState(0)
 
-        cx, cy = self.goal_center
-        # 随机改变self.goal_trajectory_type的值以测试不同轨迹
-        if steps % 20 == 0:
-            self.goal_trajectory_type = self.np_random.choice(["circle", "line", "lemniscate"])
+        self.eta = np.zeros(6, dtype=float)
+        self.nu = np.zeros(6, dtype=float)
+        self.goal = np.zeros(3, dtype=float)
 
-        if self.goal_trajectory_type == "circle":
-            # 圆轨迹
-            ang = self.goal_speed * t
-            gx = cx + self.goal_radius * np.cos(ang)
-            gy = cy + self.goal_radius * np.sin(ang)
-            return np.array([gx, gy], dtype=float)
+        self.prev_action = np.zeros(3, dtype=float)  # 3 维动作
+        self.prev_nu = np.zeros(6, dtype=float)
 
-        elif self.goal_trajectory_type == "line":
-            # 直线往返（沿 x 方向）
-            s = self.goal_speed * t
-            L = 2 * self.goal_radius
-            if L <= 0:
-                gx = cx
-            else:
-                s_mod = s % (2 * L)
-                if s_mod < L:
-                    offset = -self.goal_radius + s_mod
-                else:
-                    offset = self.goal_radius - (s_mod - L)
-                gx = cx + offset
-            gy = cy
-            return np.array([gx, gy], dtype=float)
+        self.traj = Trajectory3D(rng=self.np_random)
 
-        elif self.goal_trajectory_type == "lemniscate":
-            # 8 字形
-            ang = self.goal_speed * t
-            a = self.goal_radius
-            gx = cx + a * np.sin(ang)
-            gy = cy + a * np.sin(ang) * np.cos(ang)
-            return np.array([gx, gy], dtype=float)
-
-        # 默认：静止在中心
-        return np.array([cx, cy], dtype=float)
-
-    # === Dreamer 接口定义 ===
+    # ---- Dreamer/embodied 接口 ----
     @property
     def obs_space(self):
-        # 原来 12 维： [xe, ye, dist, cosθ, sinθ, u, v, r, x, y, gx, gy]
-        # 现在多加 3 维：phase_cos, phase_sin, t_norm -> 共 15 维
         return {
-            'vector': elements.Space(np.float32, (15,)),
-            'reward': elements.Space(np.float32),
-            'is_first': elements.Space(bool),
-            'is_last': elements.Space(bool),
-            'is_terminal': elements.Space(bool),
+            "vector": elements.Space(np.float32, (30,)),
+            "reward": elements.Space(np.float32),
+            "is_first": elements.Space(bool),
+            "is_last": elements.Space(bool),
+            "is_terminal": elements.Space(bool),
         }
 
     @property
     def act_space(self):
         return {
-            'reset': elements.Space(bool),
-            'action': elements.Space(np.float32, (2,), -1.0, 1.0),
+            "reset": elements.Space(bool),
+            "action": elements.Space(np.float32, (3,), -1.0, 1.0),
         }
 
-    def _parse_action(self, action):
-        a = action.get('action', action)
+    def _parse_action(self, action) -> Tuple[np.ndarray, np.ndarray]:
+        a = action.get("action", action)
         a = np.array(a, dtype=np.float32).reshape(-1)
         if a.size == 1:
-            a = np.array([a.item(), 0.0], dtype=np.float32)
-        assert a.size == 2, f"Continuous action must have 2 dims, got {a.size}"
+            a = np.array([a.item(), 0.0, 0.0], dtype=np.float32)
+        assert a.size == 3, f"Expect 3D continuous action, got {a.size}"
         a = np.clip(a, -1.0, 1.0)
-        Xprop = float(self.thrust_scale * a[0])
-        deltar = float(self.rudder_max * a[1])
-        return Xprop, deltar
 
-    # === step ===
-    def step(self, action):
-        if action.get('reset', False) or self.done:
+        T_prop = float(self.thrust_scale * a[0])
+        delta_r = float(self.rudder_max * a[1])
+        delta_s = float(self.stern_max * a[2])
+
+        ctrl = np.array([T_prop, delta_r, delta_s], dtype=float)
+        return a, ctrl
+
+    def _control_to_forces(self, ctrl: np.ndarray) -> np.ndarray:
+        """
+        ctrl = [T_prop, δ_r, δ_s]
+        输出 body frame 合力/力矩 tau = [X,Y,Z,K,M,N]
+
+        按论文：舵面的作用力矩 ~ u^2 δ，
+        这里用当前 surge 速度 self.nu[0] 近似来算。
+        """
+        T_prop, delta_r, delta_s = ctrl
+        p = self.params
+        u = float(self.nu[0])
+
+        X = p.X_prop_gain * T_prop                      # 推进器推力
+        Y = p.Yuudr * (u ** 2) * delta_r               # 方向舵
+        Z = p.Zuuds * (u ** 2) * delta_s               # 尾平面舵
+        K = p.K_prop_gain * T_prop                     # 若不考虑推进器扭矩，可设 0
+        M = p.Muuds * (u ** 2) * delta_s               # 尾平面舵俯仰力矩
+        N = p.Nuudr * (u ** 2) * delta_r               # 方向舵偏航力矩
+
+        return np.array([X, Y, Z, K, M, N], dtype=float)
+
+    # ---- env.step ----
+    def step(self, action: Dict[str, np.ndarray]):
+        if action.get("reset", False) or self.done:
             return self._reset()
 
-        # 时间推进
         self.time += self.dt
-
-        # 移动目标：根据轨迹更新目标点
-        if self.moving_goal:
-            self.goal = self._goal_traj(self.time, self.steps)
-
-        # 动力学更新
-        Xprop, deltar = self._parse_action(action)
-        control = np.array([Xprop, deltar], dtype=float)
-        self.state_vel = update_model_state_dyn(self.state_vel, control, self.dt)
-        self.state_pos = update_model_state_kine(self.state_pos, self.state_vel, self.dt)
-
-                # === 误差：在船体坐标系下表示目标位置 ===
-        xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
-
-        # 轨迹相位 + 归一化时间
-        phase = self.goal_speed * self.time
-        phase_cos = math.cos(phase)
-        phase_sin = math.sin(phase)
-        t_norm = self.time / (self.max_steps * self.dt + 1e-6)
-
-        # --- 跟踪 reward（原始） ---
-        eps = 1e-6
-        forward_cos = xb / (dist + eps)
-        track_reward = -dist + self.w_heading * forward_cos
-
-        # --- 能量惩罚（基于控制大小） ---
-        # 先归一化到 [-1,1] 再平方，数值更可控
-        norm_thrust = Xprop / (self.thrust_scale + eps)
-        norm_rudder = deltar / (self.rudder_max + eps)
-        energy_cost = (
-            self.energy_thrust_coef * norm_thrust**2 +
-            self.energy_rudder_coef * norm_rudder**2
-        )
-
-        # --- 控制平滑惩罚（基于控制变化） ---
-        dX = Xprop - self.prev_control[0]
-        dδ = deltar - self.prev_control[1]
-        norm_dX = dX / (self.thrust_scale + eps)
-        norm_dδ = dδ / (self.rudder_max + eps)
-        smooth_cost_ctrl = self.smooth_ctrl_coef * (norm_dX**2 + norm_dδ**2)
-
-        
-        du = self.state_vel[0] - self.prev_vel[0]
-        dv = self.state_vel[1] - self.prev_vel[1]
-        dr = self.state_vel[2] - self.prev_vel[2]
-        smooth_cost_vel = self.smooth_vel_coef * (du**2 + dv**2 + dr**2)
-
-        # --- 汇总 reward ---
-        reward = (
-            track_reward
-            - energy_cost
-            - smooth_cost_ctrl
-            - smooth_cost_vel
-        )
-
-        # === 到达判定：轨迹跟踪任务不再“追上就结束” ===
-        # success 可以保留，只用于 logging，不用于 done
-        success = dist < self.success_radius
-
         self.steps += 1
+
+        # 目标 3D 轨迹
+        self.goal, phase = self.traj(self.time)
+
+        # 解析动作并转换为控制力
+        a_norm, ctrl = self._parse_action(action)
+        tau = self._control_to_forces(ctrl)
+
+        # 6DOF 动力学
+        self.eta, self.nu = remus_dynamics_step(
+            self.params, self.eta, self.nu, tau, self.dt
+        )
+
+        # 目标在船体系下误差
+        xb, yb, zb, dist = goal_in_body_frame(self.eta, self.goal)
+
+        # 姿态编码
+        phi, theta, psi = self.eta[3:6]
+        cos_sin = np.array([
+            math.cos(phi), math.sin(phi),
+            math.cos(theta), math.sin(theta),
+            math.cos(psi), math.sin(psi),
+        ], dtype=float)
+
+        # 轨迹 phase 编码 (3 个相位的 cos/sin)
+        phase_cos = np.cos(phase)
+        phase_sin = np.sin(phase)
+
+        t_norm = self.time / (self.max_steps * self.dt + 1e-6)
+        seg_phase = (self.time - self.traj.seg_start_t) / (self.traj.seg_duration + 1e-6)
+        seg_phase = float(np.clip(seg_phase, 0.0, 1.0))
+
+        # ---- 奖励 ----
+        eps = 1e-6
+
+        # 对齐奖励：前向分量 / 距离
+        align = xb / (dist + eps)
+
+        # 距离平方 + 侧向/垂向平方
+        dist_cost = self.dist_coef * (dist ** 2)
+        lat_cost = self.lat_coef * (yb ** 2 + zb ** 2)
+
+        # 航向/俯仰误差（基于“目标方向在体坐标下的单位向量”）
+        vx, vy, vz = xb, yb, zb
+        norm_v = math.sqrt(vx * vx + vy * vy + vz * vz) + eps
+        vx /= norm_v
+        vy /= norm_v
+        vz /= norm_v
+
+        # heading_err: 侧向偏离，目标越偏到侧面越大
+        heading_err = math.atan2(abs(vy), max(vx, eps))
+        # pitch_err: 向上/向下偏的角度（vz 为负代表目标在下方）
+        pitch_err = math.atan2(-vz, math.sqrt(vx * vx + vy * vy))
+
+        heading_cost = self.heading_coef * (heading_err ** 2 + pitch_err ** 2)
+
+        track_cost = dist_cost + lat_cost + heading_cost
+        track_reward = -track_cost + self.w_align * align
+
+        # 能量耗散 (推力 + 两个舵面)
+        norm_T = ctrl[0] / (self.thrust_scale + eps)
+        norm_surfaces = np.array([
+            ctrl[1] / (self.rudder_max + eps),
+            ctrl[2] / (self.stern_max + eps),
+        ])
+        energy_cost = (
+            self.energy_thrust_coef * norm_T**2
+            + self.energy_surface_coef * float(np.sum(norm_surfaces**2))
+        )
+
+        # 控制平滑性
+        da = a_norm - self.prev_action
+        smooth_cost_ctrl = self.smooth_ctrl_coef * float(np.sum(da**2))
+
+        # 速度平滑性
+        dnu = self.nu - self.prev_nu
+        smooth_cost_vel = self.smooth_vel_coef * float(np.sum(dnu**2))
+
+        reward = track_reward - energy_cost - smooth_cost_ctrl - smooth_cost_vel
+
+        # 终止条件：纯粹按 episode 长度
         if self.steps >= self.max_steps:
             self.done = True
 
-        # 更新 prev_* 供下一步使用
-        self.prev_control = control.copy()
-        self.prev_vel = self.state_vel.copy()
+        self.prev_action = a_norm.copy()
+        self.prev_nu = self.nu.copy()
 
-        obs = np.array([
-            xb, yb, dist,
-            math.cos(self.state_pos[2]), math.sin(self.state_pos[2]),
-            self.state_vel[0], self.state_vel[1], self.state_vel[2],
-            self.state_pos[0], self.state_pos[1],
-            self.goal[0], self.goal[1],
-            phase_cos, phase_sin,
-            t_norm,
-        ], dtype=np.float32)
+        obs_vec = np.concatenate([
+            np.array([xb, yb, zb, dist], dtype=float),
+            cos_sin,
+            self.nu,
+            self.eta[0:3],
+            self.goal,
+            phase_cos,
+            phase_sin,
+            np.array([t_norm, seg_phase], dtype=float),
+        ]).astype(np.float32)
+
+        assert obs_vec.shape == (30,)
 
         return dict(
-            vector=obs,
+            vector=obs_vec,
             reward=np.float32(reward),
             is_first=False,
-            is_last=self.done,     # 只在步数用完那步为 True
-            is_terminal=False,     # 轨迹跟踪视为持续任务
+            is_last=self.done,
+            is_terminal=False,
         )
-
 
     def _reset(self):
         self.steps = 0
         self.done = False
         self.time = 0.0
 
-        # 自身初始状态
-        self.state_pos = np.array([
-            self.np_random.uniform(0, 5),
-            self.np_random.uniform(0, 5),
+        # 初始姿态/位置/速度
+        self.eta[:] = np.array([
+            self.np_random.uniform(0.0, 5.0),
+            self.np_random.uniform(0.0, 5.0),
+            self.np_random.uniform(-5.0, -1.0),  # z < 0
+            self.np_random.uniform(-0.1, 0.1),   # small roll
+            self.np_random.uniform(-0.1, 0.1),   # small pitch
             self.np_random.uniform(-math.pi, math.pi),
         ], dtype=float)
-        self.state_vel = np.zeros(3, dtype=float)
 
-        self.prev_control = np.zeros(2, dtype=float)
-        self.prev_vel = self.state_vel.copy()
+        self.nu[:] = 0.0
+        self.prev_action[:] = 0.0
+        self.prev_nu[:] = 0.0
 
-        # 目标初始位置
-        if self.moving_goal:
-            self.goal = self._goal_traj(self.time)
-        else:
-            self.goal = np.array([
-                self.np_random.uniform(8, 12),
-                self.np_random.uniform(8, 12),
-            ], dtype=float)
+        # ⭐ 每个 episode 重建一个 Trajectory3D，对应“只在开始时随机确定哪种轨迹”
+        self.traj = Trajectory3D(rng=self.np_random)
+        self.goal, phase = self.traj(self.time)
 
-        # 船体坐标系下的初始误差
-        xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
+        xb, yb, zb, dist = goal_in_body_frame(self.eta, self.goal)
+        phi, theta, psi = self.eta[3:6]
+        cos_sin = np.array([
+            math.cos(phi), math.sin(phi),
+            math.cos(theta), math.sin(theta),
+            math.cos(psi), math.sin(psi),
+        ], dtype=float)
 
-        phase = self.goal_speed * self.time
-        phase_cos = math.cos(phase)
-        phase_sin = math.sin(phase)
+        phase_cos = np.cos(phase)
+        phase_sin = np.sin(phase)
         t_norm = 0.0
+        seg_phase = 0.0
 
-        obs = np.array([
-            xb, yb, dist,
-            math.cos(self.state_pos[2]), math.sin(self.state_pos[2]),
-            self.state_vel[0], self.state_vel[1], self.state_vel[2],
-            self.state_pos[0], self.state_pos[1],
-            self.goal[0], self.goal[1],
-            phase_cos, phase_sin,
-            t_norm,
-        ], dtype=np.float32)
-
+        obs_vec = np.concatenate([
+            np.array([xb, yb, zb, dist], dtype=float),
+            cos_sin,
+            self.nu,
+            self.eta[0:3],
+            self.goal,
+            phase_cos,
+            phase_sin,
+            np.array([t_norm, seg_phase], dtype=float),
+        ]).astype(np.float32)
 
         return dict(
-            vector=obs,
+            vector=obs_vec,
             reward=np.float32(0.0),
             is_first=True,
             is_last=False,
