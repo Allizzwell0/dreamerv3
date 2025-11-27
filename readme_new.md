@@ -5,7 +5,7 @@
 python dreamerv3/main.py \
   --task auv_custom \
   --configs auv \
-  --logdir /home/mayue/logdir/auv/{timestamp} \
+  --logdir /home/mayue/logdir/auv/{timestamp}
 ```
 
 此外经常出现卡掉服务器崩现象，注意勤查看显卡状态

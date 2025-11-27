@@ -490,18 +490,23 @@ class AUVEnv(embodied.Env):
         max_steps: int = 1000,
         success_radius: float = 1.0,
         w_align: float = 1.0,
-        thrust_scale: float = 50.0,
-        rudder_max: float = 0.6,
-        stern_max: float = 0.6,
-        # ==== 新增 / 调整的奖励相关系数 ====
-        dist_coef: float = 2.0,      # 总距离平方惩罚权重
-        lat_coef: float = 1.0,       # y_b, z_b 侧向/垂向误差惩罚权重
-        heading_coef: float = 0.5,   # 航向/俯仰误差惩罚权重
-        # 能量 & 平滑：先调小一点，便于先学精确跟踪
-        energy_thrust_coef: float = 1e-5,
-        energy_surface_coef: float = 1e-4,
-        smooth_ctrl_coef: float = 1e-4,
-        smooth_vel_coef: float = 1e-5,
+        thrust_scale: float = 40.0,     # ⬅ 稍微减小推力尺度
+        rudder_max: float = 0.35,       # ⬅ 舵角限制从 0.6rad 降到 ~20°
+        stern_max: float = 0.35,
+        # ==== 跟踪精度相关系数 ====
+        dist_coef: float = 1.5,
+        lat_coef: float = 1.0,
+        heading_coef: float = 0.8,
+        # ==== 新增：速度/角速度惩罚 ====
+        vel_cost_coef: float = 0.02,    # 惩罚 |v|^2
+        rate_cost_coef: float = 0.1,    # 惩罚 |ω|^2
+        # ==== 能量 & 平滑：略小，但仍保留 ====
+        energy_thrust_coef: float = 5e-6,
+        energy_surface_coef: float = 5e-5,
+        smooth_ctrl_coef: float = 2e-4,
+        smooth_vel_coef: float = 5e-5,
+        # ==== 新增：动作一阶滤波（执行器动态） ====
+        actuator_tau: float = 0.2,      # 执行器时间常数（s），越大越慢
         **kwargs,
     ):
         del task, kwargs
@@ -521,6 +526,10 @@ class AUVEnv(embodied.Env):
         self.lat_coef = float(lat_coef)
         self.heading_coef = float(heading_coef)
 
+        # 速度/角速度惩罚
+        self.vel_cost_coef = float(vel_cost_coef)
+        self.rate_cost_coef = float(rate_cost_coef)
+
         # 能量 & 平滑代价权重
         self.energy_thrust_coef = float(energy_thrust_coef)
         self.energy_surface_coef = float(energy_surface_coef)
@@ -539,6 +548,11 @@ class AUVEnv(embodied.Env):
 
         self.prev_action = np.zeros(3, dtype=float)  # 3 维动作
         self.prev_nu = np.zeros(6, dtype=float)
+
+        # 执行器一阶滤波：ctrl_filtered = α * ctrl_prev + (1-α) * ctrl_raw
+        self.actuator_tau = float(actuator_tau)
+        self.actuator_alpha = math.exp(-self.dt / max(self.actuator_tau, 1e-3))
+        self.prev_ctrl = np.zeros(3, dtype=float)
 
         self.traj = Trajectory3D(rng=self.np_random)
 
@@ -579,24 +593,31 @@ class AUVEnv(embodied.Env):
         """
         ctrl = [T_prop, δ_r, δ_s]
         输出 body frame 合力/力矩 tau = [X,Y,Z,K,M,N]
-
-        按论文：舵面的作用力矩 ~ u^2 δ，
-        这里用当前 surge 速度 self.nu[0] 近似来算。
         """
         T_prop, delta_r, delta_s = ctrl
         p = self.params
         u = float(self.nu[0])
 
-        X = p.X_prop_gain * T_prop                      # 推进器推力
-        Y = p.Yuudr * (u ** 2) * delta_r               # 方向舵
-        Z = p.Zuuds * (u ** 2) * delta_s               # 尾平面舵
-        K = p.K_prop_gain * T_prop                     # 若不考虑推进器扭矩，可设 0
-        M = p.Muuds * (u ** 2) * delta_s               # 尾平面舵俯仰力矩
-        N = p.Nuudr * (u ** 2) * delta_r               # 方向舵偏航力矩
+        # 适当限制 u^2，避免高速下舵力爆炸
+        u_eff = max(min(u, 2.0), -2.0)
+        u2 = u_eff * u_eff
+
+        # 推进器推力
+        X = p.X_prop_gain * T_prop
+
+        # 舵面：缩减系数，降低闭环增益
+        rudder_scale = 0.5
+        stern_scale = 0.5
+
+        Y = rudder_scale * p.Yuudr * u2 * delta_r
+        Z = stern_scale * p.Zuuds * u2 * delta_s
+        K = p.K_prop_gain * T_prop  # 仍可为 0
+        M = stern_scale * p.Muuds * u2 * delta_s
+        N = rudder_scale * p.Nuudr * u2 * delta_r
 
         return np.array([X, Y, Z, K, M, N], dtype=float)
 
-    # ---- env.step ----
+
     def step(self, action: Dict[str, np.ndarray]):
         if action.get("reset", False) or self.done:
             return self._reset()
@@ -607,8 +628,15 @@ class AUVEnv(embodied.Env):
         # 目标 3D 轨迹
         self.goal, phase = self.traj(self.time)
 
-        # 解析动作并转换为控制力
-        a_norm, ctrl = self._parse_action(action)
+        # 解析动作 -> 原始控制量
+        a_norm, ctrl_raw = self._parse_action(action)
+
+        # === 执行器一阶滤波，抑制 bang-bang ===
+        alpha = self.actuator_alpha
+        ctrl = alpha * self.prev_ctrl + (1.0 - alpha) * ctrl_raw
+        self.prev_ctrl = ctrl.copy()
+
+        # 控制 -> 力 / 力矩
         tau = self._control_to_forces(ctrl)
 
         # 6DOF 动力学
@@ -638,31 +666,30 @@ class AUVEnv(embodied.Env):
         # ---- 奖励 ----
         eps = 1e-6
 
-        # 对齐奖励：前向分量 / 距离
+        # 对齐（前向分量 / 距离）
         align = xb / (dist + eps)
 
-        # 距离平方 + 侧向/垂向平方
+        # 距离 & 侧向误差
         dist_cost = self.dist_coef * (dist ** 2)
         lat_cost = self.lat_coef * (yb ** 2 + zb ** 2)
 
-        # 航向/俯仰误差（基于“目标方向在体坐标下的单位向量”）
+        # 朝向/俯仰误差
         vx, vy, vz = xb, yb, zb
         norm_v = math.sqrt(vx * vx + vy * vy + vz * vz) + eps
-        vx /= norm_v
-        vy /= norm_v
-        vz /= norm_v
-
-        # heading_err: 侧向偏离，目标越偏到侧面越大
+        vx /= norm_v; vy /= norm_v; vz /= norm_v
         heading_err = math.atan2(abs(vy), max(vx, eps))
-        # pitch_err: 向上/向下偏的角度（vz 为负代表目标在下方）
         pitch_err = math.atan2(-vz, math.sqrt(vx * vx + vy * vy))
-
         heading_cost = self.heading_coef * (heading_err ** 2 + pitch_err ** 2)
 
-        track_cost = dist_cost + lat_cost + heading_cost
+        # === 新增：速度 & 角速度惩罚 ===
+        u, v, w, p_ang, q, r = self.nu
+        vel_cost = self.vel_cost_coef * (u*u + v*v + w*w)
+        rate_cost = self.rate_cost_coef * (p_ang*p_ang + q*q + r*r)
+
+        track_cost = dist_cost + lat_cost + heading_cost + vel_cost + rate_cost
         track_reward = -track_cost + self.w_align * align
 
-        # 能量耗散 (推力 + 两个舵面)
+        # 能量耗散，用滤波后的 ctrl
         norm_T = ctrl[0] / (self.thrust_scale + eps)
         norm_surfaces = np.array([
             ctrl[1] / (self.rudder_max + eps),
@@ -673,7 +700,7 @@ class AUVEnv(embodied.Env):
             + self.energy_surface_coef * float(np.sum(norm_surfaces**2))
         )
 
-        # 控制平滑性
+        # 控制平滑性（对原始动作 a_norm）
         da = a_norm - self.prev_action
         smooth_cost_ctrl = self.smooth_ctrl_coef * float(np.sum(da**2))
 
@@ -682,8 +709,13 @@ class AUVEnv(embodied.Env):
         smooth_cost_vel = self.smooth_vel_coef * float(np.sum(dnu**2))
 
         reward = track_reward - energy_cost - smooth_cost_ctrl - smooth_cost_vel
+        # 统一缩放 reward
+        reward = reward * 0.01 
 
-        # 终止条件：纯粹按 episode 长度
+        # 再做一层 clip，保证数值稳定
+        reward = float(np.clip(reward, -10.0, 10.0))
+
+
         if self.steps >= self.max_steps:
             self.done = True
 
@@ -716,21 +748,20 @@ class AUVEnv(embodied.Env):
         self.done = False
         self.time = 0.0
 
-        # 初始姿态/位置/速度
         self.eta[:] = np.array([
             self.np_random.uniform(0.0, 5.0),
             self.np_random.uniform(0.0, 5.0),
-            self.np_random.uniform(-5.0, -1.0),  # z < 0
-            self.np_random.uniform(-0.1, 0.1),   # small roll
-            self.np_random.uniform(-0.1, 0.1),   # small pitch
+            self.np_random.uniform(-5.0, -1.0),
+            self.np_random.uniform(-0.1, 0.1),
+            self.np_random.uniform(-0.1, 0.1),
             self.np_random.uniform(-math.pi, math.pi),
         ], dtype=float)
 
         self.nu[:] = 0.0
         self.prev_action[:] = 0.0
         self.prev_nu[:] = 0.0
+        self.prev_ctrl[:] = 0.0   # ⬅ 新增
 
-        # ⭐ 每个 episode 重建一个 Trajectory3D，对应“只在开始时随机确定哪种轨迹”
         self.traj = Trajectory3D(rng=self.np_random)
         self.goal, phase = self.traj(self.time)
 
