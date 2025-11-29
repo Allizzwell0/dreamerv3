@@ -155,8 +155,8 @@ size400m: &size400m
   .*\.units: 1536`
 
 size_auv: &size_auv
-  .*\.rssm: {deter: 1024, hidden: 128, classes: 8}
-  .*\.depth: 8
+  .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
+  .*\.depth: 16
   .*\.units: 256
 
 

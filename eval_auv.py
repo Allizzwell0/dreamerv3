@@ -11,8 +11,16 @@ Usage:
 Notes:
 - This version assumes your AUVEnv uses CONTINUOUS actions (e.g. action ∈ [-1,1]^2).
 - If DreamerV3 checkpoint loading fails or isn't provided, a RandomContinuousPolicy is used.
-- If obs includes x,y,goal_x,goal_y (12-dim), they are auto-recorded into the CSV.
+- obs['vector'] 约定结构（15 维）：
+    [0:3]  xb, yb, dist（目标在船体坐标系下的误差 + 距离）
+    [3:5]  cos(theta), sin(theta)
+    [5:8]  u, v, r
+    [8:10] x, y  （世界坐标）
+    [10:12] gx, gy
+    [12:14] phase_cos, phase_sin
+    [14]   t_norm
 """
+
 from __future__ import annotations
 
 import argparse
@@ -20,7 +28,7 @@ import csv
 import math
 import os
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 import numpy as np
 
@@ -33,6 +41,11 @@ except Exception as e:
         "to point to your environment class.\n"
         f"Original error: {e}"
     )
+
+
+def _wrap_pi(a: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 
 # ------------ 连续动作 fallback 策略 ------------
@@ -171,7 +184,7 @@ def load_trained_policy(
                 """
                 等价于 Driver.reset(init_policy)，只不过我们自己调一遍。
                 Driver 里是：
-                self.carry = init_policy and init_policy(self.length)
+                  self.carry = init_policy and init_policy(self.length)
                 这里 length=1（单环境），所以 batch_size=1。
                 """
                 try:
@@ -196,22 +209,18 @@ def load_trained_policy(
                 )
 
                 # acts 是一个 dict，key 和 env.act_space 对齐：
-                #  比如 {'action': (B, act_dim)}，这里 B=1
                 if not isinstance(acts, dict):
                     raise RuntimeError(f"agent.policy() returned non-dict acts: {type(acts)}")
 
                 if "action" not in acts:
-                    # 如果你的 action 名字不是 'action'，这里可以改成别的 key
                     raise RuntimeError(f"'action' not found in policy acts keys: {list(acts.keys())}")
 
                 act_arr = np.asarray(acts["action"], dtype=np.float32)
 
                 # 期望形状是 (1, act_dim) 或 (act_dim,)；统一取第 0 个 env
                 if act_arr.ndim == 1:
-                    # 形如 (act_dim,) 的情况，直接用
                     act_vec = act_arr
                 elif act_arr.ndim >= 2:
-                    # 形如 (B, act_dim, ...) 的情况，取第一个 env
                     act_vec = act_arr[0]
                 else:
                     raise RuntimeError(f"Unexpected action shape from policy: {act_arr.shape}")
@@ -223,15 +232,12 @@ def load_trained_policy(
 
                 return {"reset": False, "action": act_vec}
 
-
-
         return ContinuousPolicyWrapper(agent, act_shape, seed)
 
     except Exception as e:
         print(f"[eval_auv] Could not load DreamerV3 policy from '{run_path}': {e}")
         print("[eval_auv] Falling back to RandomContinuousPolicy.")
         return RandomContinuousPolicy(act_low, act_high, seed)
-
 
 
 # ------------ 评估循环：使用连续动作 policy 在 AUVEnv 上 rollout ------------
@@ -243,23 +249,30 @@ def evaluate_auv(
     dt: float = 0.05,
     max_steps: int = 500,
     success_threshold: float = 1.0,
+    track_success_ratio: float = 0.8,
     out_csv: Path,
     seed: int = 0,
     verbose: bool = True,
 ) -> Dict[str, float]:
-    """Roll out multiple episodes, compute success rate, and write trajectories."""
+    """
+    Roll out multiple episodes, compute trajectory-tracking metrics, and write trajectories.
+
+    对于“轨迹跟踪”任务：
+      - 不再因为 dist <= success_threshold 提前结束 episode
+      - 每个 episode 统计：
+          mean_dist:  平均距离
+          max_dist:   最大距离
+          track_ratio:  有多少比例时间 dist <= success_threshold
+          rmse_x, rmse_y, rmse_heading: 不同自由度随时间的均方根误差
+      - success_flag: track_ratio >= track_success_ratio 视为“成功 episode”
+    """
 
     rng = np.random.default_rng(seed)
     env = AUVEnv(
-    dt=dt,
-    max_steps=max_steps,
-    moving_goal=True,             # ⭐ 开启移动目标
-    # goal_trajectory_type="circle", # 'circle' / 'line' / 'lemniscate'
-    # goal_center=(10.0, 10.0),
-    # goal_radius=3.0,
-    # goal_speed=0.3,
-)
-
+        dt=dt,
+        max_steps=max_steps,
+        moving_goal=True,             # ⭐ 开启移动目标
+    )
 
     # for reproducibility
     env.np_random.seed(seed)
@@ -275,34 +288,45 @@ def evaluate_auv(
     policy = load_trained_policy(ckpt_dir, act_shape, act_low, act_high, seed)
 
     header = [
-    "episode",
-    "t",
-    "reward",
-    "discount",
-    "x",
-    "y",
-    "theta",
-    "u",
-    "v",
-    "r",
-    "goal_x",
-    "goal_y",
-    "xe",
-    "ye",
-    "dist",
-    "phase_cos",      # ⭐ 新增
-    "phase_sin",      # ⭐ 新增
-    "t_norm",         # ⭐ 新增
-    "is_terminal",
-    "is_last",
+        "episode",
+        "t",
+        "reward",
+        "discount",
+        "x",
+        "y",
+        "theta",
+        "u",
+        "v",
+        "r",
+        "goal_x",
+        "goal_y",
+        "xe",        # body-frame 前向误差 xb
+        "ye",        # body-frame 侧向误差 yb
+        "dist",
+        "err_x",     # world-frame x 误差: gx - x
+        "err_y",     # world-frame y 误差: gy - y
+        "err_heading",  # 航向误差（期望航向 - 实际 theta，wrap 到 [-pi,pi]）
+        "phase_cos",
+        "phase_sin",
+        "t_norm",
+        "is_terminal",
+        "is_last",
     ]
-
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    ep_returns: list[float] = []
-    ep_lengths: list[int] = []
-    final_dists: list[float] = []
+    ep_returns: List[float] = []
+    ep_lengths: List[int] = []
+    final_dists: List[float] = []
+    mean_dists: List[float] = []
+    max_dists: List[float] = []
+    track_ratios: List[float] = []
+
+    # 新增：不同自由度误差的 RMSE（每个 episode 一个）
+    rmse_x_list: List[float] = []
+    rmse_y_list: List[float] = []
+    rmse_heading_list: List[float] = []
+
     successes = 0
 
     with out_csv.open("w", newline="") as f:
@@ -332,27 +356,49 @@ def evaluate_auv(
                 phase_sin = float(vec[13])
                 t_norm = float(vec[14])
 
+            # === 初始时刻的自由度误差 ===
+            if not (math.isnan(x) or math.isnan(y) or math.isnan(goal_x) or math.isnan(goal_y)):
+                err_x = goal_x - x
+                err_y = goal_y - y
+                desired_heading = math.atan2(goal_y - y, goal_x - x)
+                err_heading = _wrap_pi(desired_heading - theta)
+            else:
+                err_x = err_y = err_heading = float("nan")
+
             writer.writerow(
                 [
                     ep, 0, 0.0, 1.0,
                     x, y, theta, u, v, r_val,
                     goal_x, goal_y, xe, ye, dist,
+                    err_x, err_y, err_heading,
                     phase_cos, phase_sin, t_norm,
                     False, False,
                 ]
             )
 
-
             ep_return = 0.0
             final_dist = dist
-            success_flag = dist <= success_threshold
             steps = 0
+
+            # 收集本 episode 的所有 dist，用于统计 mean_dist / max_dist / track_ratio
+            ep_dists_step: List[float] = [dist]
+
+            # 用于计算不同自由度随时间的 RMSE
+            sum_ex2 = 0.0
+            sum_ey2 = 0.0
+            sum_hd2 = 0.0
+            count_err = 0
+
+            if not math.isnan(err_x):
+                sum_ex2 += err_x * err_x
+                sum_ey2 += err_y * err_y
+                sum_hd2 += err_heading * err_heading
+                count_err += 1
 
             for t in range(1, max_steps + 1):
                 steps = t
                 # 连续动作策略：返回 {"reset": False, "action": np.array(shape=act_shape)}
                 action = policy(traj)
-                # print("Action at step", t, ":", action["action"])
                 traj = env.step(action)
                 vec = traj["vector"]
 
@@ -371,6 +417,20 @@ def evaluate_auv(
                     phase_sin = float(vec[13])
                     t_norm = float(vec[14])
 
+                # 自由度误差（世界坐标 + 航向）
+                if not (math.isnan(x) or math.isnan(y) or math.isnan(goal_x) or math.isnan(goal_y)):
+                    err_x = goal_x - x
+                    err_y = goal_y - y
+                    desired_heading = math.atan2(goal_y - y, goal_x - x)
+                    err_heading = _wrap_pi(desired_heading - theta)
+
+                    sum_ex2 += err_x * err_x
+                    sum_ey2 += err_y * err_y
+                    sum_hd2 += err_heading * err_heading
+                    count_err += 1
+                else:
+                    err_x = err_y = err_heading = float("nan")
+
                 reward = float(traj["reward"])
                 discount = float(traj.get("discount", 1.0))
                 is_last = bool(traj["is_last"])
@@ -378,28 +438,50 @@ def evaluate_auv(
 
                 ep_return += reward
                 final_dist = dist
+                ep_dists_step.append(dist)
 
                 writer.writerow(
                     [
                         ep, t, reward, discount,
                         x, y, theta, u, v, r_val,
                         goal_x, goal_y, xe, ye, dist,
+                        err_x, err_y, err_heading,
                         phase_cos, phase_sin, t_norm,
                         is_terminal, is_last,
                     ]
                 )
 
-                EPS = 1e-6
-                if dist <= success_threshold + EPS:
-                    success_flag = True
-                    break
-
+                # 轨迹跟踪任务：只在 env 标记 is_last 时结束 episode
                 if is_last:
                     break
 
             ep_returns.append(ep_return)
             ep_lengths.append(steps)
             final_dists.append(final_dist)
+
+            ep_dists_arr = np.array(ep_dists_step, dtype=float)
+            mean_dist = float(np.mean(ep_dists_arr))
+            max_dist = float(np.max(ep_dists_arr))
+            track_ratio = float(np.mean(ep_dists_arr <= success_threshold))
+
+            mean_dists.append(mean_dist)
+            max_dists.append(max_dist)
+            track_ratios.append(track_ratio)
+
+            # RMSE（不同自由度）
+            if count_err > 0:
+                rmse_x = float(math.sqrt(sum_ex2 / count_err))
+                rmse_y = float(math.sqrt(sum_ey2 / count_err))
+                rmse_heading = float(math.sqrt(sum_hd2 / count_err))
+            else:
+                rmse_x = rmse_y = rmse_heading = float("nan")
+
+            rmse_x_list.append(rmse_x)
+            rmse_y_list.append(rmse_y)
+            rmse_heading_list.append(rmse_heading)
+
+            # 定义“成功 episode”：在 success_threshold 内的时间比例 ≥ track_success_ratio
+            success_flag = track_ratio >= track_success_ratio
             if success_flag:
                 successes += 1
 
@@ -407,7 +489,9 @@ def evaluate_auv(
                 status = "SUCCESS" if success_flag else "FAIL"
                 print(
                     f"[Episode {ep:03d}] return={ep_return:.2f} steps={steps} "
-                    f"status={status} final_dist={final_dist:.3f}"
+                    f"status={status} final_dist={final_dist:.3f} "
+                    f"mean_dist={mean_dist:.3f} track_ratio={track_ratio:.2f} "
+                    f"rmse_x={rmse_x:.3f} rmse_y={rmse_y:.3f} rmse_heading={rmse_heading:.3f}"
                 )
 
     metrics = {
@@ -419,6 +503,19 @@ def evaluate_auv(
         "avg_ep_len": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "final_dist_mean": float(np.mean(final_dists)) if final_dists else float("nan"),
         "final_dist_std": float(np.std(final_dists)) if final_dists else float("nan"),
+        # 轨迹跟踪相关指标
+        "mean_dist_mean": float(np.mean(mean_dists)) if mean_dists else float("nan"),
+        "mean_dist_std": float(np.std(mean_dists)) if mean_dists else float("nan"),
+        "max_dist_mean": float(np.mean(max_dists)) if max_dists else float("nan"),
+        "track_ratio_mean": float(np.mean(track_ratios)) if track_ratios else float("nan"),
+        "track_ratio_std": float(np.std(track_ratios)) if track_ratios else float("nan"),
+        # 新增：不同自由度的 RMSE 指标（episode 级别的平均）
+        "rmse_x_mean": float(np.mean(rmse_x_list)) if rmse_x_list else float("nan"),
+        "rmse_x_std": float(np.std(rmse_x_list)) if rmse_x_list else float("nan"),
+        "rmse_y_mean": float(np.mean(rmse_y_list)) if rmse_y_list else float("nan"),
+        "rmse_y_std": float(np.std(rmse_y_list)) if rmse_y_list else float("nan"),
+        "rmse_heading_mean": float(np.mean(rmse_heading_list)) if rmse_heading_list else float("nan"),
+        "rmse_heading_std": float(np.std(rmse_heading_list)) if rmse_heading_list else float("nan"),
         "csv_path": os.path.abspath(out_csv),
     }
     return metrics
@@ -434,8 +531,15 @@ def main():
     parser.add_argument(
         "--success_threshold",
         type=float,
-        default=1.0,  # match your env's success_radius default (1.0)
-        help="Distance (m) regarded as a successful reach (independent of is_terminal).",
+        default=1.0,  # 跟 env 的 success_radius 对齐，用于统计 track_ratio
+        help="Distance (m) regarded as 'good tracking' for ratio/statistics.",
+    )
+    parser.add_argument(
+        "--track_success_ratio",
+        type=float,
+        default=0.8,
+        help="Episode is counted as SUCCESS if fraction of steps with dist <= success_threshold "
+             "is at least this value (e.g. 0.8).",
     )
     parser.add_argument(
         "--out_dir",
@@ -461,6 +565,7 @@ def main():
         dt=args.dt,
         max_steps=args.max_steps,
         success_threshold=args.success_threshold,
+        track_success_ratio=args.track_success_ratio,
         out_csv=csv_path,
         seed=args.seed,
         verbose=True,

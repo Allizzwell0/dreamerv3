@@ -5,7 +5,7 @@
 python dreamerv3/main.py \
   --task auv_custom \
   --configs auv \
-  --logdir /home/mayue/logdir/auv/{timestamp} \
+  --logdir /home/mayue/logdir/auv/{timestamp} 
 ```
 
 此外经常出现卡掉服务器崩现象，注意勤查看显卡状态
@@ -17,7 +17,7 @@ python dreamerv3/main.py \
 ```bash
 python eval_auv.py \
   --ckpt /home/mayue/logdir/auv/{timestamp} \
-  --episodes 50 \
+  --episodes 200 \
   --out_dir /home/mayue/logdir/auv/{timestamp}/eval_output
 ```
 可能出现问题找不到checkpoint，需要debug

@@ -74,6 +74,24 @@ def update_model_state_kine(state, input, dt):
 def _wrap_pi(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
+def goal_in_body_frame(state_pos, goal):
+    """
+    state_pos: [x, y, theta] in world frame
+    goal: [gx, gy] in world frame
+    return: (x_b, y_b, dist) 目标在船体坐标系下的位置和距离
+    """
+    x, y, theta = state_pos
+    gx, gy = goal
+    dx = gx - x
+    dy = gy - y
+    c = math.cos(theta)
+    s = math.sin(theta)
+    # 世界 -> 船体
+    xb = c * dx + s * dy
+    yb = -s * dx + c * dy
+    dist = float(math.hypot(xb, yb))
+    return xb, yb, dist
+
 
 # ----------------- 连续动作 + 移动目标的 AUV 环境 -----------------
 class AUVEnv(embodied.Env):
@@ -85,26 +103,35 @@ class AUVEnv(embodied.Env):
       action[1] -> 相对舵角（-1~1），内部映射到 [-rudder_max, +rudder_max] rad
 
     支持静态目标 + 移动目标：
-      - moving_goal=False: 目标是随机静止点（你原来的设定）
-      - moving_goal=True : 目标按指定轨迹移动
+      - moving_goal=False: 目标是随机静止点
+      - moving_goal=True :
+          * goal_trajectory_type in {'circle','line','lemniscate'}: 固定一种轨迹
+          * goal_trajectory_type == 'random': 若干秒后随机切换到另一种轨迹类型
     """
 
     def __init__(
         self,
         task=None,
         dt=0.05,
-        max_steps=500,
+        max_steps=1000,
         success_radius=1.0,
         w_heading=0.2,
         thrust_scale=50.0,
         rudder_max=0.6,
-        # === 新增：移动目标相关参数 ===
+        # === 移动目标相关参数 ===
         moving_goal=True,
-        goal_trajectory_type="circle",   # 'circle' / 'line' / 'lemniscate'
+        # 'circle' / 'line' / 'lemniscate' / 'random'
+        #   - 'circle' 等：整局固定该轨迹
+        #   - 'random'  ：在若干秒后随机切换轨迹类型
+        goal_trajectory_type="random",
         goal_center=(10.0, 10.0),
         goal_radius=6.0,
         goal_speed=0.3,
         goal_custom_fn=None,             # 自定义：fn(t) -> (gx, gy)
+        energy_thrust_coef=1e-4,
+        energy_rudder_coef=1e-3,
+        smooth_ctrl_coef=1e-3,
+        smooth_vel_coef=1e-3,   # 速度惩罚
         **kwargs,
     ):
         del task, kwargs
@@ -116,12 +143,19 @@ class AUVEnv(embodied.Env):
         self.rudder_max = float(rudder_max)
 
         self.moving_goal = bool(moving_goal)
-        # self.goal_trajectory_type = np.random.choice(["circle", "line", "lemniscate"])
-        self.goal_trajectory_type = "line"
+        # 这里保留用户传入的类型；当为 'random' 时启用“分段随机切换”
+        self.goal_trajectory_type = str(goal_trajectory_type)
         self.goal_center = tuple(goal_center)
         self.goal_radius = float(goal_radius)
         self.goal_speed = float(goal_speed)
         self.goal_custom_fn = goal_custom_fn
+        self.energy_thrust_coef = float(energy_thrust_coef)
+        self.energy_rudder_coef = float(energy_rudder_coef)
+        self.smooth_ctrl_coef = float(smooth_ctrl_coef)
+        self.smooth_vel_coef = float(smooth_vel_coef)
+
+        self.prev_control = np.zeros(2, dtype=float)
+        self.prev_vel = np.zeros(3, dtype=float)
 
         self.steps = 0
         self.done = False
@@ -134,27 +168,153 @@ class AUVEnv(embodied.Env):
         # 时间，用于移动目标的“动力学/轨迹”
         self.time = 0.0
 
+        # ====== 复杂目标轨迹：分段 + 多种类型 ======
+        # 支持的轨迹类型集合，用于 'random' 模式下随机选择
+        self.traj_types = ["circle", "line", "lemniscate", "lissajous"]
+
+        # 当前 segment 的信息（仅在 goal_trajectory_type == 'random' 时使用）
+        self.seg_start_t = 0.0
+        self.seg_duration = 0.0
+        self.current_traj_type = None
+        self.seg_params = {}
+
+    # === 采样一个新的 segment：随机轨迹类型 + 参数 ===
+    def _sample_new_segment(self, t: float):
+        """
+        仅在 goal_trajectory_type == 'random' 时使用。
+        在时间 t 开启一个新的轨迹段：
+          - 随机挑选 self.traj_types 中的一种
+          - 给这一段采样对应的参数
+          - 设定持续时间 seg_duration（秒）
+        """
+        self.seg_start_t = float(t)
+        # 每段持续 5~20 秒，取决于 dt 会对应若干 steps
+        self.seg_duration = float(self.np_random.uniform(5.0, 20.0))
+
+        # 随机选择一种轨迹类型（可以避免与上一段重复，也可以允许重复）
+        self.current_traj_type = self.np_random.choice(self.traj_types)
+
+        cx, cy = self.goal_center
+        base_r = self.goal_radius
+        v = self.goal_speed
+
+        params = {}
+
+        if self.current_traj_type == "circle":
+            # 圆轨迹：随机圆心偏移 + 半径 + 顺/逆时针
+            offset = self.np_random.uniform(-base_r * 0.5, base_r * 0.5, size=2)
+            center = np.array([cx, cy], dtype=float) + offset
+            radius = float(base_r * self.np_random.uniform(0.7, 1.3))
+            direction = float(self.np_random.choice([-1.0, 1.0]))  # 顺/逆时针
+            params.update(center=center, radius=radius, direction=direction)
+
+        elif self.current_traj_type == "line":
+            # 直线轨迹：从某个起点沿随机方向匀速运动
+            # 起点在中心附近随机，方向在 [0, 2π) 随机
+            start = np.array([
+                cx + self.np_random.uniform(-base_r, base_r),
+                cy + self.np_random.uniform(-base_r, base_r),
+            ], dtype=float)
+            angle = self.np_random.uniform(-np.pi, np.pi)
+            direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+            direction /= (np.linalg.norm(direction) + 1e-6)
+            speed = v * self.np_random.uniform(0.5, 1.5)
+            params.update(start=start, direction=direction, speed=speed)
+
+        elif self.current_traj_type == "lemniscate":
+            # 经典 8 字形：中心附近 + 半径
+            offset = self.np_random.uniform(-base_r * 0.5, base_r * 0.5, size=2)
+            center = np.array([cx, cy], dtype=float) + offset
+            a = float(base_r * self.np_random.uniform(0.7, 1.3))
+            params.update(center=center, a=a)
+
+        elif self.current_traj_type == "lissajous":
+            # Lissajous 曲线：x = cx + A sin(a*t + φ1), y = cy + B sin(b*t + φ2)
+            center = np.array([cx, cy], dtype=float)
+            A = float(base_r * self.np_random.uniform(0.5, 1.0))
+            B = float(base_r * self.np_random.uniform(0.5, 1.0))
+            # 频率比选一些小整数，轨迹比较漂亮
+            a = int(self.np_random.choice([1, 2, 3]))
+            b = int(self.np_random.choice([2, 3, 4]))
+            phi1 = float(self.np_random.uniform(0.0, 2 * np.pi))
+            phi2 = float(self.np_random.uniform(0.0, 2 * np.pi))
+            params.update(center=center, A=A, B=B, a=a, b=b, phi1=phi1, phi2=phi2)
+
+        self.seg_params = params
+
     # === 目标轨迹 ===
     def _goal_traj(self, t):
         """根据时间 t 计算目标位置 (gx, gy)。"""
+
         # 若用户提供自定义轨迹，优先使用
         if self.goal_custom_fn is not None:
             gx, gy = self.goal_custom_fn(t)
             return np.array([gx, gy], dtype=float)
 
         cx, cy = self.goal_center
-        # 随机改变self.goal_trajectory_type的值以测试不同轨迹
-        # self.goal_trajectory_type = self.np_random.choice(["circle", "line", "lemniscate"])
 
+        # ===== 模式一：随机分段切换轨迹类型 =====
+        if self.goal_trajectory_type == "random":
+            # 如果还没初始化当前段，或当前段结束了，就采样一段新的
+            if (
+                self.current_traj_type is None or
+                (t - self.seg_start_t) > self.seg_duration
+            ):
+                self._sample_new_segment(t)
+
+            dt_seg = float(t - self.seg_start_t)
+            v = self.goal_speed
+            w = v / max(self.goal_radius, 1e-3)  # 角速度基准
+
+            if self.current_traj_type == "circle":
+                center = self.seg_params["center"]
+                radius = self.seg_params["radius"]
+                direction = self.seg_params["direction"]
+                ang = direction * w * dt_seg
+                gx = center[0] + radius * np.cos(ang)
+                gy = center[1] + radius * np.sin(ang)
+                return np.array([gx, gy], dtype=float)
+
+            elif self.current_traj_type == "line":
+                start = self.seg_params["start"]
+                direction = self.seg_params["direction"]
+                speed = self.seg_params["speed"]
+                gx, gy = start + direction * speed * dt_seg
+                return np.array([gx, gy], dtype=float)
+
+            elif self.current_traj_type == "lemniscate":
+                center = self.seg_params["center"]
+                a = self.seg_params["a"]
+                ang = w * dt_seg
+                gx = center[0] + a * np.sin(ang)
+                gy = center[1] + a * np.sin(ang) * np.cos(ang)
+                return np.array([gx, gy], dtype=float)
+
+            elif self.current_traj_type == "lissajous":
+                center = self.seg_params["center"]
+                A = self.seg_params["A"]
+                B = self.seg_params["B"]
+                a = self.seg_params["a"]
+                b = self.seg_params["b"]
+                phi1 = self.seg_params["phi1"]
+                phi2 = self.seg_params["phi2"]
+                # 这里直接用 w * t 带入频率倍数
+                ang = w * dt_seg
+                gx = center[0] + A * np.sin(a * ang + phi1)
+                gy = center[1] + B * np.sin(b * ang + phi2)
+                return np.array([gx, gy], dtype=float)
+
+            # fallback：万一类型不认识
+            return np.array([cx, cy], dtype=float)
+
+        # ===== 模式二：老的固定轨迹模式（与之前兼容） =====
         if self.goal_trajectory_type == "circle":
-            # 圆轨迹
             ang = self.goal_speed * t
             gx = cx + self.goal_radius * np.cos(ang)
             gy = cy + self.goal_radius * np.sin(ang)
             return np.array([gx, gy], dtype=float)
 
         elif self.goal_trajectory_type == "line":
-            # 直线往返（沿 x 方向）
             s = self.goal_speed * t
             L = 2 * self.goal_radius
             if L <= 0:
@@ -170,7 +330,6 @@ class AUVEnv(embodied.Env):
             return np.array([gx, gy], dtype=float)
 
         elif self.goal_trajectory_type == "lemniscate":
-            # 8 字形
             ang = self.goal_speed * t
             a = self.goal_radius
             gx = cx + a * np.sin(ang)
@@ -211,7 +370,7 @@ class AUVEnv(embodied.Env):
         deltar = float(self.rudder_max * a[1])
         return Xprop, deltar
 
-    # === step ===
+      # === step ===
     def step(self, action):
         if action.get('reset', False) or self.done:
             return self._reset()
@@ -229,34 +388,66 @@ class AUVEnv(embodied.Env):
         self.state_vel = update_model_state_dyn(self.state_vel, control, self.dt)
         self.state_pos = update_model_state_kine(self.state_pos, self.state_vel, self.dt)
 
-        # 误差与朝向
-        xe = self.state_pos[0] - self.goal[0]
-        ye = self.state_pos[1] - self.goal[1]
-        dist = float(np.hypot(xe, ye))
-        bearing = math.atan2(self.goal[1] - self.state_pos[1],
-                             self.goal[0] - self.state_pos[0])
-        heading_err = _wrap_pi(bearing - self.state_pos[2])
+        # === 误差：在船体坐标系下表示目标位置 ===
+        xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
-        # 轨迹相位 + 归一化时间（给世界模型“节奏感”）
+        # 轨迹相位 + 归一化时间
         phase = self.goal_speed * self.time
         phase_cos = math.cos(phase)
         phase_sin = math.sin(phase)
         t_norm = self.time / (self.max_steps * self.dt + 1e-6)
 
-        # 奖励（仍然是拦截型）
-        reward = -dist + self.w_heading * math.cos(heading_err)
+        # --- 跟踪 reward（保持原来的形式） ---
+        eps = 1e-6
+        forward_cos = xb / (dist + eps)
+        track_reward = -dist + self.w_heading * forward_cos
 
-        success = dist < self.success_radius
-        if success:
-            reward += 50.0
-            self.done = True   # 如果想持续跟踪，可以把这一行注释掉
+        # --- 能量惩罚（基于控制大小） ---
+        norm_thrust = Xprop / (self.thrust_scale + eps)
+        norm_rudder = deltar / (self.rudder_max + eps)
+        energy_cost = (
+            self.energy_thrust_coef * norm_thrust**2 +
+            self.energy_rudder_coef * norm_rudder**2
+        )
 
+        # --- 控制平滑惩罚（基于控制变化） ---
+        dX = Xprop - self.prev_control[0]
+        dδ = deltar - self.prev_control[1]
+        norm_dX = dX / (self.thrust_scale + eps)
+        norm_dδ = dδ / (self.rudder_max + eps)
+        smooth_cost_ctrl = self.smooth_ctrl_coef * (norm_dX**2 + norm_dδ**2)
+
+        # 基于速度变化的平滑惩罚
+        du = self.state_vel[0] - self.prev_vel[0]
+        dv = self.state_vel[1] - self.prev_vel[1]
+        dr = self.state_vel[2] - self.prev_vel[2]
+        smooth_cost_vel = self.smooth_vel_coef * (du**2 + dv**2 + dr**2)
+
+        # --- 汇总 reward ---
+        reward = (
+            track_reward
+            - energy_cost
+            - smooth_cost_ctrl
+            - smooth_cost_vel
+        )
+
+        # ✅ 轨迹跟踪任务：不再因为 dist 小而提前结束
+        # success = dist < self.success_radius
+        # if success:
+        #     reward += 10.0
+        #     self.done = True
+
+        # 只按步数结束一集
         self.steps += 1
         if self.steps >= self.max_steps:
             self.done = True
 
+        # 更新 prev_* 供下一步使用
+        self.prev_control = control.copy()
+        self.prev_vel = self.state_vel.copy()
+
         obs = np.array([
-            xe, ye, dist,
+            xb, yb, dist,                                # 船体系误差
             math.cos(self.state_pos[2]), math.sin(self.state_pos[2]),
             self.state_vel[0], self.state_vel[1], self.state_vel[2],
             self.state_pos[0], self.state_pos[1],
@@ -270,8 +461,10 @@ class AUVEnv(embodied.Env):
             reward=np.float32(reward),
             is_first=False,
             is_last=self.done,
-            is_terminal=self.done,  # 如需区分“成功/超时”，可改为 is_terminal=success
+            # ✅ 轨迹跟踪：episode 结束只是“时间到”，不是“终止状态”
+            is_terminal=False,
         )
+
 
     def _reset(self):
         self.steps = 0
@@ -286,6 +479,15 @@ class AUVEnv(embodied.Env):
         ], dtype=float)
         self.state_vel = np.zeros(3, dtype=float)
 
+        self.prev_control = np.zeros(2, dtype=float)
+        self.prev_vel = self.state_vel.copy()
+
+        # 重置随机轨迹段信息（下次 _goal_traj 会自动 sample）
+        self.seg_start_t = 0.0
+        self.seg_duration = 0.0
+        self.current_traj_type = None
+        self.seg_params = {}
+
         # 目标初始位置
         if self.moving_goal:
             self.goal = self._goal_traj(self.time)
@@ -295,9 +497,7 @@ class AUVEnv(embodied.Env):
                 self.np_random.uniform(8, 12),
             ], dtype=float)
 
-        xe = self.state_pos[0] - self.goal[0]
-        ye = self.state_pos[1] - self.goal[1]
-        dist = float(np.hypot(xe, ye))
+        xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
         phase = self.goal_speed * self.time
         phase_cos = math.cos(phase)
@@ -305,7 +505,7 @@ class AUVEnv(embodied.Env):
         t_norm = 0.0
 
         obs = np.array([
-            xe, ye, dist,
+            xb, yb, dist,
             math.cos(self.state_pos[2]), math.sin(self.state_pos[2]),
             self.state_vel[0], self.state_vel[1], self.state_vel[2],
             self.state_pos[0], self.state_pos[1],
