@@ -37,3 +37,35 @@ python plot_auv.py \
 python -m scope.viewer --basedir ~/logdir/auv --port 8000
 ```
 后续可能多加入几项指标，实现当前轨迹跟踪图示展示
+
+
+# 用于Chemistry
+api
+
+```bash
+export NEWAPI_API_KEY="sk-eZiZsS9eylMzAfLHmfhVufNsjXAJzFxlfIi1bzQzKFYTqygx"
+```
+
+训练
+
+```bash
+python3 main.py ~/WorldModel/Dreamer/papers/test/ --workers 32 --retries 3 --save-images 
+```
+
+# 服务器走代理
+由于远程配置clash太麻烦，采用本地挂梯子，然后SSH反向代理实现
+具体配置已经写进了ssh文件，本机端口7897，服务器代理走7897就行
+命令为：
+```bash
+export http_proxy=http://127.0.0.1:7897
+export https_proxy=http://127.0.0.1:7897
+```
+
+如果要在当前terminal取消代理：
+```bash
+unset http_proxy;
+unset https_proxy;
+```
+
+# liver相关
+这部分医学分割任务的相关命令

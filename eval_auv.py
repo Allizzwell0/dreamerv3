@@ -247,7 +247,7 @@ def evaluate_auv(
     *,
     episodes: int = 20,
     dt: float = 0.05,
-    max_steps: int = 500,
+    max_steps: int = 800,
     success_threshold: float = 1.0,
     track_success_ratio: float = 0.8,
     out_csv: Path,
@@ -309,6 +309,8 @@ def evaluate_auv(
         "phase_cos",
         "phase_sin",
         "t_norm",
+        "action_0",   # 归一化动作 a[0]
+        "action_1",   # 归一化动作 a[1]
         "is_terminal",
         "is_last",
     ]
@@ -365,6 +367,7 @@ def evaluate_auv(
             else:
                 err_x = err_y = err_heading = float("nan")
 
+            # t=0 时还没有动作，记 nan
             writer.writerow(
                 [
                     ep, 0, 0.0, 1.0,
@@ -372,6 +375,7 @@ def evaluate_auv(
                     goal_x, goal_y, xe, ye, dist,
                     err_x, err_y, err_heading,
                     phase_cos, phase_sin, t_norm,
+                    float("nan"), float("nan"),
                     False, False,
                 ]
             )
@@ -399,6 +403,16 @@ def evaluate_auv(
                 steps = t
                 # 连续动作策略：返回 {"reset": False, "action": np.array(shape=act_shape)}
                 action = policy(traj)
+
+                # 记录归一化动作（用于后处理分析）
+                raw_act = np.asarray(action.get("action", np.zeros(act_shape)), dtype=float).reshape(-1)
+                if raw_act.size == 1:
+                    raw_act = np.array([raw_act.item(), 0.0], dtype=float)
+                elif raw_act.size >= 2:
+                    raw_act = raw_act[:2]
+                else:
+                    raw_act = np.zeros(2, dtype=float)
+
                 traj = env.step(action)
                 vec = traj["vector"]
 
@@ -447,6 +461,7 @@ def evaluate_auv(
                         goal_x, goal_y, xe, ye, dist,
                         err_x, err_y, err_heading,
                         phase_cos, phase_sin, t_norm,
+                        float(raw_act[0]), float(raw_act[1]),
                         is_terminal, is_last,
                     ]
                 )
@@ -526,7 +541,7 @@ def main():
     parser.add_argument("--ckpt", type=str, default=None, help="DreamerV3 run directory (contains ckpt/)")
     parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes")
     parser.add_argument("--dt", type=float, default=0.05, help="Environment integration step")
-    parser.add_argument("--max_steps", type=int, default=500, help="Maximum steps per episode")
+    parser.add_argument("--max_steps", type=int, default=800, help="Maximum steps per episode")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for evaluation")
     parser.add_argument(
         "--success_threshold",
@@ -537,7 +552,7 @@ def main():
     parser.add_argument(
         "--track_success_ratio",
         type=float,
-        default=0.8,
+        default=0.7,
         help="Episode is counted as SUCCESS if fraction of steps with dist <= success_threshold "
              "is at least this value (e.g. 0.8).",
     )

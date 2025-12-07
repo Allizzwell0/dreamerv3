@@ -11,18 +11,21 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional
 
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import numpy as np
 
 
 # ===================== CSV 读取与预处理 =====================
 
-def load_csv(path: Path) -> List[Dict[str, str]]:
+def load_csv(path: Path) -> Tuple[List[Dict[str, str]], List[str]]:
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f)
-        return list(reader)
+        rows = list(reader)
+        fieldnames = reader.fieldnames or []
+    return rows, fieldnames
 
 
 def _to_float(value: str, default: float = np.nan) -> float:
@@ -43,7 +46,7 @@ def group_rows_by_episode(rows: Iterable[Dict[str, str]]) -> Dict[int, List[Dict
     return episodes
 
 
-def prepare_episode_arrays(rows: List[Dict[str, str]]) -> Dict[str, np.ndarray]:
+def prepare_episode_arrays(rows: List[Dict[str, str]], fieldnames: List[str]) -> Dict[str, np.ndarray]:
     # 按时间步排序
     rows_sorted = sorted(rows, key=lambda r: int(r["t"]))
 
@@ -53,7 +56,7 @@ def prepare_episode_arrays(rows: List[Dict[str, str]]) -> Dict[str, np.ndarray]:
             dtype=dtype,
         )
 
-    data = {
+    data: Dict[str, np.ndarray] = {
         "t": np.asarray([int(r["t"]) for r in rows_sorted], dtype=int),
         "reward": arr("reward", default=0.0),
         "dist": arr("dist"),
@@ -67,7 +70,7 @@ def prepare_episode_arrays(rows: List[Dict[str, str]]) -> Dict[str, np.ndarray]:
         # 目标轨迹
         "goal_x": arr("goal_x"),
         "goal_y": arr("goal_y"),
-        # 误差（新加：与 eval_auv.py 对齐）
+        # 误差（与 eval_auv.py 对齐）
         "err_x": arr("err_x"),
         "err_y": arr("err_y"),
         "err_heading": arr("err_heading"),  # rad
@@ -81,6 +84,17 @@ def prepare_episode_arrays(rows: List[Dict[str, str]]) -> Dict[str, np.ndarray]:
             dtype=bool,
         ),
     }
+
+    # 可选：动作列（来自扩展版 eval_auv.py）
+    act_cols = [name for name in fieldnames if name.startswith("action_")]
+    if act_cols:
+        T = len(rows_sorted)
+        acts = np.zeros((T, len(act_cols)), dtype=float)
+        for i, r in enumerate(rows_sorted):
+            for j, col in enumerate(act_cols):
+                acts[i, j] = _to_float(r.get(col, "nan"), default=np.nan)
+        data["acts"] = acts
+        data["act_cols"] = np.array(act_cols, dtype=object)
 
     return data
 
@@ -325,12 +339,282 @@ def plot_success_histories(
     return figs
 
 
+def plot_dof_curves(
+    data: Dict[str, np.ndarray],
+    episode: int,
+    dof_name: str,
+    err_key: str,
+    vel_key: str,
+    act_index: Optional[int] = None,
+):
+    """
+    单独为某个自由度画几条曲线并保存：
+      - error(t)   : data[err_key]
+      - velocity(t): data[vel_key]
+      - action(t)  : data['acts'][:, act_index]（如果存在）
+
+    dof_name 只用于文件名和 title，例如 'x'、'y'、'heading' 等。
+    """
+    t = data["t"]
+
+    if err_key not in data or vel_key not in data:
+        return None
+
+    err = data[err_key].astype(float)
+    vel = data[vel_key].astype(float)
+
+    # 航向误差改成角度便于看
+    if err_key == "err_heading":
+        err = np.rad2deg(err)
+        err_label = f"{err_key} (deg)"
+    else:
+        err_label = f"{err_key}"
+    vel_label = f"{vel_key}"
+
+    # 取对应的动作
+    act = None
+    acts = data.get("acts", None)
+    if acts is not None and acts.size > 0 and act_index is not None:
+        if 0 <= act_index < acts.shape[1]:
+            act = acts[:, act_index].astype(float)
+
+    n_rows = 3 if act is not None else 2
+    fig, axes = plt.subplots(n_rows, 1, figsize=(8, 2.6 * n_rows), sharex=True)
+
+    if n_rows == 2:
+        ax_err, ax_vel = axes
+        ax_act = None
+    else:
+        ax_err, ax_vel, ax_act = axes
+
+    # 误差曲线
+    ax_err.plot(t, err)
+    ax_err.set_ylabel(err_label)
+    ax_err.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+    # 速度曲线
+    ax_vel.plot(t, vel)
+    ax_vel.set_ylabel(vel_label)
+    ax_vel.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+    # 动作曲线
+    if ax_act is not None and act is not None:
+        ax_act.plot(t, act)
+        ax_act.set_ylabel(f"action[{act_index}]")
+        ax_act.set_xlabel("time step")
+        ax_act.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+    else:
+        ax_vel.set_xlabel("time step")
+
+    fig.suptitle(f"Episode {episode}: DOF '{dof_name}' error / velocity / action", y=0.95)
+    fig.tight_layout()
+
+    filename = f"episode_{episode:03d}_dof_{dof_name}.png"
+    return fig, filename
+
+
+def create_episode_animation(
+    data: Dict[str, np.ndarray],
+    episode: int,
+    out_dir: Path,
+    fps: int = 20,
+    dpi: int = 150,
+) -> None:
+    """
+    为指定 episode 生成轨迹 + 误差/动作 的 mp4 动图，直接保存到 out_dir，
+    不弹出任何窗口。
+    """
+    t = data["t"]
+    x = data["x"]
+    y = data["y"]
+    gx = data.get("goal_x", np.full_like(x, np.nan, dtype=float))
+    gy = data.get("goal_y", np.full_like(y, np.nan, dtype=float))
+    dist = data.get("dist", np.full_like(t, np.nan, dtype=float))
+    err_x = data.get("err_x", np.full_like(t, np.nan, dtype=float))
+    err_y = data.get("err_y", np.full_like(t, np.nan, dtype=float))
+    err_h = data.get("err_heading", np.full_like(t, np.nan, dtype=float))
+    acts = data.get("acts", None)
+    act_cols = data.get("act_cols", None)
+
+    T = len(t)
+    if T == 0:
+        print(f"[plot_auv] Episode {episode}: no data, skip animation.")
+        return
+
+    # 画布：上半部分平面轨迹，下半部分误差 + 动作随时间
+    fig = plt.figure(figsize=(8, 8))
+
+    ax_traj = fig.add_subplot(2, 1, 1)
+    ax_traj.set_title(f"Episode {episode}: AUV Trajectory (World Frame)")
+    ax_traj.set_xlabel("x [m]")
+    ax_traj.set_ylabel("y [m]")
+    ax_traj.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+    # 整体目标轨迹
+    goal_mask = ~np.isnan(gx) & ~np.isnan(gy)
+    if np.any(goal_mask):
+        ax_traj.plot(gx[goal_mask], gy[goal_mask], linestyle="--", alpha=0.5, label="Goal path")
+
+    # AUV 历史轨迹和当前点、当前目标点
+    (line_auv,) = ax_traj.plot([], [], linewidth=2.0, label="AUV path")
+    (point_auv,) = ax_traj.plot([], [], marker="o", markersize=6)
+    (point_goal,) = ax_traj.plot([], [], marker="x", markersize=6)
+
+    ax_traj.legend(loc="best")
+
+    # 下半部分：误差 + 动作
+    ax_err = fig.add_subplot(2, 1, 2)
+    ax_err.set_title("Errors and Actions over Time")
+    ax_err.set_xlabel("time step")
+    ax_err.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+    (line_dist,) = ax_err.plot([], [], label="dist")
+    (line_ex,) = ax_err.plot([], [], label="err_x")
+    (line_ey,) = ax_err.plot([], [], label="err_y")
+
+    act_lines: List = []
+    if acts is not None and acts.size > 0:
+        act_dim = acts.shape[1]
+        # 如果有 act_cols 就用 act_cols 做标签，否则用 action_0,1,...
+        if act_cols is not None and len(act_cols) == act_dim:
+            labels = [str(c) for c in act_cols]
+        else:
+            labels = [f"action_{i}" for i in range(act_dim)]
+        for lab in labels:
+            (ln,) = ax_err.plot([], [], label=lab)
+            act_lines.append(ln)
+
+    ax_err.legend(ncol=2, fontsize=8)
+
+    # 左上角文本：当前 step 的误差 + 动作
+    text_info = ax_traj.text(
+        0.02,
+        0.95,
+        "",
+        transform=ax_traj.transAxes,
+        verticalalignment="top",
+        fontsize=9,
+    )
+
+    # 设置 traj 图的坐标范围
+    valid_x = x[~np.isnan(x)]
+    valid_y = y[~np.isnan(y)]
+    if np.any(goal_mask):
+        valid_x = np.concatenate([valid_x, gx[goal_mask]])
+        valid_y = np.concatenate([valid_y, gy[goal_mask]])
+
+    if valid_x.size > 0 and valid_y.size > 0:
+        margin = 1.0
+        ax_traj.set_xlim(valid_x.min() - margin, valid_x.max() + margin)
+        ax_traj.set_ylim(valid_y.min() - margin, valid_y.max() + margin)
+
+    # err 图的 y 轴范围
+    y_candidates = []
+    for arr in (dist, err_x, err_y):
+        if arr.size and not np.all(np.isnan(arr)):
+            y_candidates.append(arr[~np.isnan(arr)])
+    if acts is not None and acts.size > 0:
+        finite_acts = acts[np.isfinite(acts)]
+        if finite_acts.size:
+            y_candidates.append(finite_acts)
+    if y_candidates:
+        ymin = min(np.min(c) for c in y_candidates)
+        ymax = max(np.max(c) for c in y_candidates)
+        if np.isfinite(ymin) and np.isfinite(ymax):
+            pad = 0.1 * (ymax - ymin + 1e-6)
+            ax_err.set_ylim(ymin - pad, ymax + pad)
+    ax_err.set_xlim(t.min(), t.max())
+
+    def init():
+        line_auv.set_data([], [])
+        point_auv.set_data([], [])
+        point_goal.set_data([], [])
+        line_dist.set_data([], [])
+        line_ex.set_data([], [])
+        line_ey.set_data([], [])
+        for ln in act_lines:
+            ln.set_data([], [])
+        text_info.set_text("")
+        return (
+            line_auv,
+            point_auv,
+            point_goal,
+            line_dist,
+            line_ex,
+            line_ey,
+            *act_lines,
+            text_info,
+        )
+
+    def update(frame: int):
+        i = frame
+        # 轨迹（线：前 i+1 个点；当前点：长度1的序列）
+        line_auv.set_data(x[: i + 1], y[: i + 1])
+        point_auv.set_data([x[i]], [y[i]])  # ★ 必须是序列
+
+        if not np.isnan(gx[i]) and not np.isnan(gy[i]):
+            point_goal.set_data([gx[i]], [gy[i]])  # ★ 必须是序列
+        else:
+            point_goal.set_data([], [])
+
+        # 误差 + 动作
+        tt = t[: i + 1]
+        line_dist.set_data(tt, dist[: i + 1])
+        line_ex.set_data(tt, err_x[: i + 1])
+        line_ey.set_data(tt, err_y[: i + 1])
+
+        if acts is not None and acts.size > 0:
+            for j, ln in enumerate(act_lines):
+                ln.set_data(tt, acts[: i + 1, j])
+
+        # 文本
+        msg_lines = [
+            f"t = {t[i]:.0f}",
+            f"dist = {dist[i]:.3f}",
+            f"err_x = {err_x[i]:.3f}",
+            f"err_y = {err_y[i]:.3f}",
+            f"err_heading = {err_h[i]:.3f} rad",
+        ]
+        if acts is not None and acts.size > 0:
+            act_vals = ", ".join(f"{acts[i, j]:.3f}" for j in range(acts.shape[1]))
+            msg_lines.append(f"acts: {act_vals}")
+        text_info.set_text("\n".join(msg_lines))
+
+        return (
+            line_auv,
+            point_auv,
+            point_goal,
+            line_dist,
+            line_ex,
+            line_ey,
+            *act_lines,
+            text_info,
+        )
+
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        frames=T,
+        init_func=init,
+        blit=True,
+        interval=1000.0 / float(fps),
+    )
+
+    out_path = out_dir / f"episode_{episode:03d}_anim.mp4"
+    print(f"[plot_auv] Saving animation to: {out_path}")
+    try:
+        ani.save(out_path, fps=fps, dpi=dpi)
+    except Exception as e:
+        print(f"[plot_auv] Failed to save animation: {e}")
+    plt.close(fig)
+
+
 # ===================== 主入口 =====================
 
 def main():
     parser = argparse.ArgumentParser(description="Plot AUV evaluation trajectories")
     parser.add_argument("--csv", type=str, default="eval_outputs/trajectories.csv")
-    parser.add_argument("--episode", type=int, default=0, help="Episode index for per-step plots")
+    parser.add_argument("--episode", type=int, default=0, help="Episode index for per-step plots and animation")
     parser.add_argument(
         "--out_dir",
         type=str,
@@ -341,14 +625,20 @@ def main():
     parser.add_argument(
         "--success_threshold",
         type=float,
-        default=1.0,  # 要和 eval_auv.py 里的 success_threshold 对齐
+        default=1.0,
         help="Distance threshold (m) used to judge 'good tracking' when computing track_ratio",
     )
     parser.add_argument(
         "--track_success_ratio",
         type=float,
-        default=0.8,  # 要和 eval_auv.py 里的 track_success_ratio 对齐
+        default=0.8,
         help="Episode is considered SUCCESS if track_ratio >= this value.",
+    )
+    parser.add_argument(
+        "--anim_fps",
+        type=int,
+        default=20,
+        help="Frames per second of the saved animation video.",
     )
     args = parser.parse_args()
 
@@ -356,14 +646,14 @@ def main():
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    rows = load_csv(csv_path)
+    rows, fieldnames = load_csv(csv_path)
     grouped = group_rows_by_episode(rows)
     if not grouped:
         raise ValueError("No episode data found in CSV.")
 
     # 转换为 numpy 数组便于后续计算
     episode_arrays: Dict[int, Dict[str, np.ndarray]] = {
-        ep: prepare_episode_arrays(ep_rows) for ep, ep_rows in grouped.items()
+        ep: prepare_episode_arrays(ep_rows, fieldnames) for ep, ep_rows in grouped.items()
     }
 
     target_episode = args.episode
@@ -376,7 +666,7 @@ def main():
 
     out_dir = Path(args.out_dir).expanduser() if args.out_dir else csv_path.parent / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[plot_auv] Saving figures to: {out_dir}")
+    print(f"[plot_auv] Saving figures and animation to: {out_dir}")
 
     # 打印每个 episode 的 summary
     print("\n[plot_auv] Episode summaries:")
@@ -409,7 +699,7 @@ def main():
     dist_fig = plot_distance_reward(ep_data, target_episode)
     figures.append(dist_fig)
 
-    # 新增：误差随时间曲线
+    # 误差随时间曲线
     err_fig = plot_error_profiles(ep_data, target_episode)
     if err_fig is not None:
         figures.append(err_fig)
@@ -420,10 +710,57 @@ def main():
     if overview_figs:
         figures.extend(overview_figs)
 
+        # ===== 单独保存几个自由度的 error + 输入 + 输出速度 曲线 =====
+    # DOF 1：x 自由度，err_x + u + action_0
+    dof_x_fig = plot_dof_curves(
+        ep_data,
+        target_episode,
+        dof_name="x",
+        err_key="err_x",
+        vel_key="u",
+        act_index=0,   # action[0] 对应纵向推进器
+    )
+    if dof_x_fig is not None:
+        figures.append(dof_x_fig)
+
+    # DOF 2：y 自由度，err_y + v + action_1
+    dof_y_fig = plot_dof_curves(
+        ep_data,
+        target_episode,
+        dof_name="y",
+        err_key="err_y",
+        vel_key="v",
+        act_index=1,   # action[1] 主要影响横向/转向（舵）
+    )
+    if dof_y_fig is not None:
+        figures.append(dof_y_fig)
+
+    # DOF 3：航向自由度，err_heading + r + action_1
+    dof_heading_fig = plot_dof_curves(
+        ep_data,
+        target_episode,
+        dof_name="heading",
+        err_key="err_heading",
+        vel_key="r",
+        act_index=1,   # 航向同样主要由舵控制
+    )
+    if dof_heading_fig is not None:
+        figures.append(dof_heading_fig)
+
+
     for fig, name in figures:
         fig.savefig(out_dir / name, dpi=args.dpi)
         plt.close(fig)
         print(f"[plot_auv] Saved {name}")
+
+    # 生成动画（直接保存 mp4）
+    create_episode_animation(
+        ep_data,
+        target_episode,
+        out_dir,
+        fps=args.anim_fps,
+        dpi=args.dpi,
+    )
 
 
 if __name__ == "__main__":

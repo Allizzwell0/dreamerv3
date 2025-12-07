@@ -3,48 +3,6 @@ import math
 import elements
 import embodied
 
-# ========== Tracking Differentiator ==========
-
-class TrackingDifferentiator:
-    """
-    Han 型二阶 TD，用于对输入 v(t) 做平滑跟踪并给出带限幅的导数。
-    """
-    def __init__(self, r=2.0, h=0.05, N=5.0):
-        self.r = float(r)
-        self.h = float(h)
-        self.N = float(N)
-        self.x1 = 0.0
-        self.x2 = 0.0
-
-    def reset(self, v0=0.0):
-        self.x1 = float(v0)
-        self.x2 = 0.0
-
-    def step(self, v):
-        r = self.r
-        h = self.h
-        h0 = self.N * h
-
-        x1, x2 = self.x1, self.x2
-        v = float(v)
-
-        d = r * h0 * h0
-        a0 = x2 * h
-        y = x1 - v + a0
-
-        if abs(y) > d:
-            a1 = math.sqrt(d * (d + 8.0 * abs(y)))
-            a2 = a0 + 0.5 * (a1 - d) * math.copysign(1.0, y)
-        else:
-            a2 = a0 + y
-
-        x1 = x1 + h * x2
-        x2 = x2 - r * a2
-
-        self.x1, self.x2 = x1, x2
-        return x1, x2   # x1: 平滑距离, x2: 距离变化率
-
-
 # ----------------- 动力学 / 运动学模型 -----------------
 def update_model_state_dyn(state, input, dt):
     Xuu = -1.62e0
@@ -75,12 +33,12 @@ def update_model_state_dyn(state, input, dt):
     Xprop, deltar = input
     u, v, r = state
 
-    # 限幅（防炸）
-    u = np.clip(u, -10.0, 10.0)
-    v = np.clip(v, -10.0, 10.0)
-    r = np.clip(r, -6.0, 6.0)
-    deltar = np.clip(deltar, -1.5, 1.5)
-    Xprop = np.clip(Xprop, -300.0, 300.0)
+    # 限幅
+    u = np.clip(u, -5.0, 5.0)
+    v = np.clip(v, -5.0, 5.0)
+    r = np.clip(r, -3.0, 3.0)
+    deltar = np.clip(deltar, -0.6, 0.6)
+    Xprop = np.clip(Xprop, -50.0, 50.0)
 
     M = np.array([
         [m - Xu, 0.0, -m * yg],
@@ -141,47 +99,44 @@ class AUVEnv(embodied.Env):
     """
     AUV 3 自由度（x, y, ψ）+ 动力学模型环境（连续动作）
 
-    - AUV 用 Remus 简化 2D 动力学 + 运动学
-    - 目标也用相同动力学，但控制输入为“平滑随机”，且最大速度小于 AUV
+    action: shape=(2,), float32, 范围[-1, 1]
+      action[0] -> 相对推力（-1~1），内部映射到 [-thrust_scale, +thrust_scale] N
+      action[1] -> 相对舵角（-1~1），内部映射到 [-rudder_max, +rudder_max] rad
+
+    支持静态目标 + 移动目标：
+      - moving_goal=False: 目标是随机静止点
+      - moving_goal=True :
+          * goal_trajectory_type in {'circle','line','lemniscate','lissajous'}: 固定一种轨迹
+          * goal_trajectory_type == 'random': 若干秒后随机切换到另一种轨迹类型（本代码中默认只用 circle + line）
     """
 
     def __init__(
         self,
         task=None,
         dt=0.05,
-        max_steps=800,
+        max_steps=1000,
         success_radius=1.0,
         w_heading=0.1,
         thrust_scale=50.0,
         rudder_max=0.6,
-
-        # === 目标相关参数 ===
+        # === 移动目标相关参数 ===
         moving_goal=True,
+        # 'circle' / 'line' / 'lemniscate' / 'lissajous' / 'random'
+        goal_trajectory_type="random",
         goal_center=(10.0, 10.0),
         goal_radius=6.0,
         goal_speed=0.3,
 
-        # AUV 自身最大速度 / 角速度
-        max_auv_speed=3.0,
-        max_auv_turn_rate=1.0,
+        # ⭐ 限制目标自身的速度 / 角速度 / 分段时长
+        max_goal_speed=0.8,               # 目标线速度上限 (m/s)
+        max_goal_turn_rate=0.3,           # 目标角速度上限 (rad/s)
+        seg_duration_range=(10.0, 30.0),  # 每段轨迹持续时间范围 (s)
 
-        # 目标最大速度 / 角速度
-        max_goal_speed=0.5,
-        max_goal_turn_rate=0.3,
-
-        # 目标控制尺度和更新策略
-        goal_thrust_scale=20.0,
-        goal_rudder_max=0.3,
-        goal_ctrl_interval=10,
-        goal_ctrl_smooth=0.8,
-
-        goal_custom_fn=None,
-
-        # === Reward 中能量 / 平滑项 ===
-        energy_thrust_coef=5e-3,
-        energy_rudder_coef=1e-2,
-        smooth_ctrl_coef=1e-2,
-        smooth_vel_coef=5e-2,
+        goal_custom_fn=None,              # 自定义：fn(t) -> (gx, gy)
+        energy_thrust_coef=1e-4,
+        energy_rudder_coef=1e-3,
+        smooth_ctrl_coef=5e-3,
+        smooth_vel_coef=5e-3,             # 速度惩罚
         **kwargs,
     ):
         del task, kwargs
@@ -193,23 +148,15 @@ class AUVEnv(embodied.Env):
         self.rudder_max = float(rudder_max)
 
         self.moving_goal = bool(moving_goal)
+        self.goal_trajectory_type = str(goal_trajectory_type)
         self.goal_center = tuple(goal_center)
         self.goal_radius = float(goal_radius)
         self.goal_speed = float(goal_speed)
 
-        # AUV 速度约束
-        self.max_auv_speed = float(max_auv_speed)
-        self.max_auv_turn_rate = float(max_auv_turn_rate)
-
-        # 目标速度约束
+        # ⭐ 平滑 & 可跟踪约束
         self.max_goal_speed = float(max_goal_speed)
         self.max_goal_turn_rate = float(max_goal_turn_rate)
-
-        # 目标控制尺度和更新策略
-        self.goal_thrust_scale = float(goal_thrust_scale)
-        self.goal_rudder_max = float(goal_rudder_max)
-        self.goal_ctrl_interval = int(goal_ctrl_interval)
-        self.goal_ctrl_smooth = float(goal_ctrl_smooth)
+        self.seg_min, self.seg_max = map(float, seg_duration_range)
 
         self.goal_custom_fn = goal_custom_fn
         self.energy_thrust_coef = float(energy_thrust_coef)
@@ -219,73 +166,161 @@ class AUVEnv(embodied.Env):
 
         self.prev_control = np.zeros(2, dtype=float)
         self.prev_vel = np.zeros(3, dtype=float)
-        self.prev_dist = None        # 上一步“平滑后距离”
 
         self.steps = 0
         self.done = False
         self.np_random = np.random.RandomState(0)
 
-        # AUV 自身状态
         self.state_pos = np.zeros(3, dtype=float)   # [x, y, theta]
         self.state_vel = np.zeros(3, dtype=float)   # [u, v, r]
-
-        # 目标“外部”坐标（世界系）
         self.goal = np.zeros(2, dtype=float)
 
-        # 目标内部动力学状态
-        self.goal_pos = np.zeros(3, dtype=float)  # [x, y, theta]
-        self.goal_vel = np.zeros(3, dtype=float)  # [u, v, r]
-
-        # 目标控制内部状态
-        self.goal_control = np.zeros(2, dtype=float)  # [Xprop_g, deltar_g]
-        self.goal_ctrl_step = 0
-
-        # 时间
+        # 时间，用于移动目标的“动力学/轨迹”
         self.time = 0.0
 
-        # === New: 距离 TD ===
-        self.td_dist = TrackingDifferentiator(
-            r=2.0,
-            h=self.dt,
-            N=5.0,
-        )
+        # ====== 复杂目标轨迹：分段 + 多种类型 ======
+        # 为了保证可跟踪，默认只用 circle + line
+        self.traj_types = ["circle", "line"]
 
-    # === 目标轨迹（动力学 + 平滑随机控制）===
+        # 当前 segment 的信息（仅在 goal_trajectory_type == 'random' 时使用）
+        self.seg_start_t = 0.0
+        self.seg_duration = 0.0
+        self.current_traj_type = None
+        self.seg_params = {}
+
+    # === 采样一个新的 segment：随机轨迹类型 + 参数 ===
+    def _sample_new_segment(self, t, start_pos=None):
+        """
+        仅在 goal_trajectory_type == 'random' 时使用。
+        在时间 t 开启一个新的轨迹段：
+          - 随机挑选 self.traj_types 中的一种
+          - 以当前 goal 位置为起点，采样对应轨迹参数
+          - 设定持续时间 seg_duration（秒）
+        """
+        self.seg_start_t = float(t)
+        # 每段持续时间更长，且可配置
+        self.seg_duration = float(self.np_random.uniform(self.seg_min, self.seg_max))
+
+        # 起点：优先用当前目标位置，否则用 goal_center
+        if start_pos is None:
+            start_pos = np.array(self.goal_center, dtype=float)
+        else:
+            start_pos = np.asarray(start_pos, dtype=float)
+
+        # 当前段轨迹类型
+        self.current_traj_type = self.np_random.choice(self.traj_types)
+
+        base_r = self.goal_radius
+        # 目标线速度上限
+        base_speed = min(self.goal_speed, self.max_goal_speed)
+
+        params = {}
+
+        if self.current_traj_type == "circle":
+            # 圆轨迹：保证圆弧通过 start_pos
+            radius = float(base_r * self.np_random.uniform(0.8, 1.2))
+            # 取一个随机法向方向，作为圆心相对于 start_pos 的方向
+            normal_angle = self.np_random.uniform(-math.pi, math.pi)
+            normal = np.array([math.cos(normal_angle), math.sin(normal_angle)], dtype=float)
+            center = start_pos + radius * normal
+            # 令 ang0 对应 start_pos
+            ang0 = math.atan2(start_pos[1] - center[1], start_pos[0] - center[0])
+            direction = float(self.np_random.choice([-1.0, 1.0]))  # 顺/逆时针
+            params.update(center=center, radius=radius, ang0=ang0, direction=direction)
+
+        elif self.current_traj_type == "line":
+            # 直线：从 start_pos 出发，朝随机方向匀速运动
+            angle = self.np_random.uniform(-math.pi, math.pi)
+            direction = np.array([math.cos(angle), math.sin(angle)], dtype=float)
+            direction /= (np.linalg.norm(direction) + 1e-6)
+            speed = base_speed * self.np_random.uniform(0.5, 1.0)
+            params.update(start=start_pos, direction=direction, speed=speed)
+
+        self.seg_params = params
+
+    # === 目标轨迹 ===
     def _goal_traj(self, t):
-        # 用户自定义轨迹优先
+        """根据时间 t 计算目标位置 (gx, gy)。"""
+
+        # 若用户提供自定义轨迹，优先使用
         if self.goal_custom_fn is not None:
             gx, gy = self.goal_custom_fn(t)
             return np.array([gx, gy], dtype=float)
 
-        # ---- 控制更新（平滑随机）----
-        if self.goal_ctrl_step % self.goal_ctrl_interval == 0:
-            noise = self.np_random.uniform(-1.0, 1.0, size=2)
-            target_ctrl = np.array(
-                [noise[0] * self.goal_thrust_scale,
-                 noise[1] * self.goal_rudder_max],
-                dtype=float,
-            )
-            self.goal_control = (
-                self.goal_ctrl_smooth * self.goal_control
-                + (1.0 - self.goal_ctrl_smooth) * target_ctrl
-            )
+        cx, cy = self.goal_center
 
-        self.goal_ctrl_step += 1
-        control_g = self.goal_control
+        # ===== 模式一：随机分段切换轨迹类型 =====
+        if self.goal_trajectory_type == "random":
+            # 如果还没初始化当前段，或当前段结束了，就采样一段新的
+            if (
+                self.current_traj_type is None
+                or (t - self.seg_start_t) > self.seg_duration
+            ):
+                # 把当前目标位置作为新段起点，保证位置连续
+                self._sample_new_segment(t, start_pos=self.goal)
 
-        # ---- 动力学推进目标速度 ----
-        self.goal_vel = update_model_state_dyn(self.goal_vel, control_g, self.dt)
+            dt_seg = float(t - self.seg_start_t)
 
-        # 速度裁剪
-        self.goal_vel[0] = np.clip(self.goal_vel[0], -self.max_goal_speed, self.max_goal_speed)
-        self.goal_vel[1] = np.clip(self.goal_vel[1], -self.max_goal_speed, self.max_goal_speed)
-        self.goal_vel[2] = np.clip(self.goal_vel[2], -self.max_goal_turn_rate, self.max_goal_turn_rate)
+            # 线速度与角速度上限
+            base_v = min(self.goal_speed, self.max_goal_speed)
+            radius_ref = max(self.goal_radius, 1.0)
+            w_nominal = base_v / radius_ref
+            w = min(w_nominal, self.max_goal_turn_rate)  # 角速度上限
 
-        # ---- 运动学推进目标位置 ----
-        self.goal_pos = update_model_state_kine(self.goal_pos, self.goal_vel, self.dt)
+            if self.current_traj_type == "circle":
+                center = self.seg_params["center"]
+                radius = self.seg_params["radius"]
+                ang0 = self.seg_params["ang0"]
+                direction = self.seg_params["direction"]
 
-        # 返回世界系中的 (x, y)
-        return self.goal_pos[:2].copy()
+                # 根据 dt_seg 增加角度，限制 w
+                w_eff = min(base_v / max(radius, 1e-3), self.max_goal_turn_rate)
+                ang = ang0 + direction * w_eff * dt_seg
+                gx = center[0] + radius * math.cos(ang)
+                gy = center[1] + radius * math.sin(ang)
+                return np.array([gx, gy], dtype=float)
+
+            elif self.current_traj_type == "line":
+                start = self.seg_params["start"]
+                direction = self.seg_params["direction"]
+                speed = self.seg_params["speed"]  # 已经被 base_speed 控制
+                gx, gy = start + direction * speed * dt_seg
+                return np.array([gx, gy], dtype=float)
+
+            # fallback：万一类型不认识
+            return np.array([cx, cy], dtype=float)
+
+        # ===== 模式二：老的固定轨迹模式（与之前兼容） =====
+        if self.goal_trajectory_type == "circle":
+            ang = self.goal_speed * t
+            gx = cx + self.goal_radius * math.cos(ang)
+            gy = cy + self.goal_radius * math.sin(ang)
+            return np.array([gx, gy], dtype=float)
+
+        elif self.goal_trajectory_type == "line":
+            s = self.goal_speed * t
+            L = 2.0 * self.goal_radius
+            if L <= 0.0:
+                gx = cx
+            else:
+                s_mod = s % (2.0 * L)
+                if s_mod < L:
+                    offset = -self.goal_radius + s_mod
+                else:
+                    offset = self.goal_radius - (s_mod - L)
+                gx = cx + offset
+            gy = cy
+            return np.array([gx, gy], dtype=float)
+
+        elif self.goal_trajectory_type == "lemniscate":
+            ang = self.goal_speed * t
+            a = self.goal_radius
+            gx = cx + a * math.sin(ang)
+            gy = cy + a * math.sin(ang) * math.cos(ang)
+            return np.array([gx, gy], dtype=float)
+
+        # 默认：静止在中心
+        return np.array([cx, cy], dtype=float)
 
     # === Dreamer 接口定义 ===
     @property
@@ -325,30 +360,18 @@ class AUVEnv(embodied.Env):
         # 时间推进
         self.time += self.dt
 
-        # --------- 目标动力学推进 ----------
+        # 移动目标：根据轨迹更新目标点
         if self.moving_goal:
             self.goal = self._goal_traj(self.time)
 
-        # --------- AUV 动力学推进 ----------
+        # 动力学更新
         Xprop, deltar = self._parse_action(action)
         control = np.array([Xprop, deltar], dtype=float)
-
-        # 动力学更新速度
         self.state_vel = update_model_state_dyn(self.state_vel, control, self.dt)
-
-        # AUV 速度裁剪
-        self.state_vel[0] = np.clip(self.state_vel[0], -self.max_auv_speed, self.max_auv_speed)
-        self.state_vel[1] = np.clip(self.state_vel[1], -self.max_auv_speed, self.max_auv_speed)
-        self.state_vel[2] = np.clip(self.state_vel[2], -self.max_auv_turn_rate, self.max_auv_turn_rate)
-
-        # 运动学更新位置
         self.state_pos = update_model_state_kine(self.state_pos, self.state_vel, self.dt)
 
         # === 误差：在船体坐标系下表示目标位置 ===
         xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
-
-        # TD 平滑距离
-        dist_td, dist_dot_td = self.td_dist.step(dist)
 
         # 轨迹相位 + 归一化时间
         phase = self.goal_speed * self.time
@@ -356,44 +379,24 @@ class AUVEnv(embodied.Env):
         phase_sin = math.sin(phase)
         t_norm = self.time / (self.max_steps * self.dt + 1e-6)
 
-                # ========== Reward 计算开始 ==========
+        # ========== Reward 计算开始 ==========
         eps = 1e-6
 
-        # 1) 用 TD 平滑距离做“进度”奖励
-        if self.prev_dist is None:
-            self.prev_dist = dist_td
-        progress = self.prev_dist - dist_td          # >0: 靠近目标
-        self.prev_dist = dist_td
+        # 1) 距离归一化到 [0, 1]，参考距离用 2 * goal_radius
+        radius_ref = max(2.0 * self.goal_radius, 1e-6)
+        dist_norm = np.clip(dist / radius_ref, 0.0, 1.0)
 
-        base_k_progress = 4.0
+        # 2) 航向对齐程度：目标在船体 x 轴上的投影比例
+        forward_cos = xb / (dist + eps)
 
-        # 2) 以 success_radius 为尺度的距离归一化（0 附近更敏感）
-        #    rho = dist_td / R, 只关心 0~3R 的范围
-        rho = dist_td / (self.success_radius + eps)
-        rho = np.clip(rho, 0.0, 3.0)
-        gamma = 0.6                                   # 0<gamma<1，越小近零越敏感
-        dist_norm = (rho / 3.0) ** gamma             # ∈[0,1]，0=贴着目标，1≈3R
+        # 3) 距离越远时 heading 权重越大，越近时越小（0.3 ~ 1.0 之间平滑变化）
+        heading_scale = 0.3 + 0.7 * dist_norm
 
-        # 3) 航向项：距离相关的权重（远处大一点，近处显著变小）
-        heading_err = math.atan2(yb, xb)             # 0 表示目标在正前方
-        k_heading_base = 0.3
-        heading_scale = 0.3 + 0.7 * dist_norm        # dist_norm=0→0.3, =1→1.0
-        k_heading_eff = k_heading_base * heading_scale
+        # 4) 跟踪奖励：距离 + 航向
+        track_reward = -dist_norm + self.w_heading * heading_scale * forward_cos
 
-        raw_cos = math.cos(heading_err)
-        cos_clipped = max(raw_cos, 0.0)              # 只奖励“朝前”，背对不额外强罚
-        r_heading = k_heading_eff * cos_clipped
-
-        # 4) 绝对距离项（惩罚离目标太远的状态）
-        k_dist = 0.5
-        r_dist = -k_dist * dist_norm                 # 近处 ≈ 0，远处 ≈ -0.5
-
-        # 5) progress：越靠近目标权重越大，鼓励贴着目标微调
-        #    dist_norm=0（很近）→ k≈4.8；dist_norm≈1（3R）→ k≈4.0
-        k_progress = base_k_progress * (1.2 - 0.2 * dist_norm)
-        r_progress = k_progress * progress
-
-        # ---------- 能量和速度惩罚 ----------
+        # ---------- 能量和速度的“可变权重” ----------
+        # （1）先算基础惩罚
         norm_thrust = Xprop / (self.thrust_scale + eps)
         norm_rudder = deltar / (self.rudder_max + eps)
         base_energy_cost = (
@@ -410,76 +413,31 @@ class AUVEnv(embodied.Env):
         du = self.state_vel[0] - self.prev_vel[0]
         dv = self.state_vel[1] - self.prev_vel[1]
         dr = self.state_vel[2] - self.prev_vel[2]
+        base_smooth_cost_vel = self.smooth_vel_coef * (du**2 + dv**2 + dr**2)
 
-        # 速度平滑基准项（整体比控制平滑重一些）
-        base_smooth_cost_vel = 2.0 * self.smooth_vel_coef * (du**2 + dv**2 + dr**2)
-
-        # --------- 距离相关的缩放：越靠近目标惩罚越大 ---------
-        # 能量和控制平滑：远处惩罚较小，近处明显加重
-        #   dist_norm=1(≈3R) → energy_scale≈1.0，smooth_ctrl_scale≈1.0
-        #   dist_norm=0(贴近) → energy_scale≈2.5，smooth_ctrl_scale≈4.0
-        energy_scale      = 1.0 + 1.5 * (1.0 - dist_norm)
-        smooth_ctrl_scale = 1.0 + 3.0 * (1.0 - dist_norm)
-
-        # 绝对速度惩罚（靠近目标时不希望速度太大）
-        speed2 = (
-            self.state_vel[0]**2
-            + self.state_vel[1]**2
-            + self.state_vel[2]**2
-        )
-        # near：在 3R 以内逐渐启动，越靠近 R 越强
-        near = np.clip(
-            (3.0 * self.success_radius - dist_td)
-            / (3.0 * self.success_radius + eps),
-            0.0, 1.0,
-        )
-        k_speed_near = 0.6     # 比之前略大，靠近目标时明显压速度
-        speed_cost_near = k_speed_near * near * speed2
-
-        # 速度平滑缩放：远处有轻微惩罚，近处明显增强
-        a_vel_far  = 0.5       # 远处附加系数
-        b_vel_near = 5.0       # 近处附加系数（可在 4~6 间微调）
-
-        # dist_norm：0 近，1 远; near：0 远，1 很近
-        smooth_vel_scale = (
-            1.0
-            + a_vel_far  * dist_norm
-            + b_vel_near * near * (1.0 - dist_norm)
-        )
+        # （2）根据距离动态调整权重：
+        #     远处（dist_norm≈1）：scale ≈ 1.0
+        #     近处（dist_norm≈0）：energy ≈ 3.0，smooth ≈ 4.0
+        energy_scale       = 1.0 + 2.0 * (1.0 - dist_norm)
+        smooth_ctrl_scale  = 1.0 + 3.0 * (1.0 - dist_norm)
+        smooth_vel_scale   = 1.0 + 3.0 * (1.0 - dist_norm)
 
         energy_cost      = energy_scale      * base_energy_cost
         smooth_cost_ctrl = smooth_ctrl_scale * base_smooth_cost_ctrl
         smooth_cost_vel  = smooth_vel_scale  * base_smooth_cost_vel
 
-        # 6) 目标附近的额外奖励 + “停留奖励”
-        goal_bonus = 0.0
-        hold_bonus = 0.0
-        if dist_td < self.success_radius:
-            bonus_max = 1.5
-            proximity = 1.0 - dist_td / (self.success_radius + eps)
-            goal_bonus = bonus_max * proximity
-
-            # 在成功区域内每一步额外给一点奖励，鼓励停在目标附近
-            hold_bonus = 0.5
-
         # 7) 汇总 reward
         reward = (
-            r_progress
-            + r_heading
-            + r_dist
-            + goal_bonus
-            + hold_bonus
+            0.5                 # baseline 正奖励
+            + track_reward
             - energy_cost
             - smooth_cost_ctrl
             - smooth_cost_vel
-            - speed_cost_near
         )
-        reward = float(np.clip(reward, -10.0, 10.0))
+        reward = float(np.clip(reward, -1.0, 1.0))
         # ========== Reward 计算结束 ==========
 
-
-
-        # 轨迹跟踪任务：只按步数结束（任务不变）
+        # 轨迹跟踪任务：只按步数结束
         self.steps += 1
         if self.steps >= self.max_steps:
             self.done = True
@@ -492,7 +450,7 @@ class AUVEnv(embodied.Env):
             [
                 xb,
                 yb,
-                dist,  # 这里仍然输出原始 dist，TD 只在内部用
+                dist,
                 math.cos(self.state_pos[2]),
                 math.sin(self.state_pos[2]),
                 self.state_vel[0],
@@ -517,6 +475,7 @@ class AUVEnv(embodied.Env):
             is_terminal=False,
         )
 
+
     def _reset(self):
         self.steps = 0
         self.done = False
@@ -535,22 +494,16 @@ class AUVEnv(embodied.Env):
 
         self.prev_control = np.zeros(2, dtype=float)
         self.prev_vel = self.state_vel.copy()
-        self.prev_dist = None
+
+        # 重置随机轨迹段信息（下次 _goal_traj 会自动 sample）
+        self.seg_start_t = 0.0
+        self.seg_duration = 0.0
+        self.current_traj_type = None
+        self.seg_params = {}
 
         # 目标初始位置
         if self.moving_goal:
-            self.goal_pos = np.array(
-                [
-                    self.np_random.uniform(8.0, 12.0),
-                    self.np_random.uniform(8.0, 12.0),
-                    self.np_random.uniform(-math.pi, math.pi),
-                ],
-                dtype=float,
-            )
-            self.goal_vel = np.zeros(3, dtype=float)
-            self.goal = self.goal_pos[:2].copy()
-            self.goal_control = np.zeros(2, dtype=float)
-            self.goal_ctrl_step = 0
+            self.goal = self._goal_traj(self.time)
         else:
             self.goal = np.array(
                 [
@@ -559,16 +512,8 @@ class AUVEnv(embodied.Env):
                 ],
                 dtype=float,
             )
-            self.goal_pos = np.array([self.goal[0], self.goal[1], 0.0], dtype=float)
-            self.goal_vel = np.zeros(3, dtype=float)
-            self.goal_control = np.zeros(2, dtype=float)
-            self.goal_ctrl_step = 0
 
         xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
-
-        # TD 初始化
-        self.td_dist.reset(dist)
-        self.prev_dist = dist
 
         phase = self.goal_speed * self.time
         phase_cos = math.cos(phase)
