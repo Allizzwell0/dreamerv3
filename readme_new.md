@@ -67,5 +67,3 @@ unset http_proxy;
 unset https_proxy;
 ```
 
-# liver相关
-这部分医学分割任务的相关命令
