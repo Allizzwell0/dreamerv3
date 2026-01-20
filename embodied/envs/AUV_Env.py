@@ -1,7 +1,35 @@
-import numpy as np
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AUVEnv (Dreamer/embodied.Env)
+
+新增能力（用于定位“过冲发生了什么”）：
+1) 过冲检测（overshoot）：基于 dist_td 相对历史最小值回弹
+2) 诊断信号输出到 obs 的 log/* 字段（不会进入 world model，因为 make_agent 里过滤了 log/ 前缀）
+3) 可选：保存 episode 轨迹到 CSV（包含过冲时刻前后全程信息），方便你画图定位动作/速度/heading_err 等变化
+
+用法（在 configs.yaml 的 env.auv 里加）例如：
+  env:
+    auv:
+      debug_trace: True
+      trace_dir: /home/mayue/logdir/auv_debug_traces
+      overshoot_eps: 0.2
+      overshoot_min_steps: 20
+      save_trace_on_done: True
+      save_trace_on_overshoot: True
+      seed: 0
+"""
+
+import os
+import csv
 import math
+import numpy as np
+from pathlib import Path
+
 import elements
 import embodied
+from collections import deque
+
 
 # ========== Tracking Differentiator ==========
 
@@ -46,6 +74,7 @@ class TrackingDifferentiator:
 
 
 # ----------------- 动力学 / 运动学模型 -----------------
+
 def update_model_state_dyn(state, input, dt):
     Xuu = -1.62e0
     Nvv = -3.18e0
@@ -113,10 +142,6 @@ def update_model_state_kine(state, input, dt):
     return np.array([x, y, theta])
 
 
-def _wrap_pi(a):
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-
 def goal_in_body_frame(state_pos, goal):
     """
     state_pos: [x, y, theta] in world frame
@@ -129,7 +154,6 @@ def goal_in_body_frame(state_pos, goal):
     dy = gy - y
     c = math.cos(theta)
     s = math.sin(theta)
-    # 世界 -> 船体
     xb = c * dx + s * dy
     yb = -s * dx + c * dy
     dist = float(math.hypot(xb, yb))
@@ -137,12 +161,10 @@ def goal_in_body_frame(state_pos, goal):
 
 
 # ----------------- 连续动作 + 移动目标的 AUV 环境 -----------------
+
 class AUVEnv(embodied.Env):
     """
     AUV 3 自由度（x, y, ψ）+ 动力学模型环境（连续动作）
-
-    - AUV 用 Remus 简化 2D 动力学 + 运动学
-    - 目标也用相同动力学，但控制输入为“平滑随机”，且最大速度小于 AUV
     """
 
     def __init__(
@@ -150,7 +172,7 @@ class AUVEnv(embodied.Env):
         task=None,
         dt=0.05,
         max_steps=800,
-        success_radius=1.0,
+        success_radius=0.5,
         w_heading=0.1,
         thrust_scale=50.0,
         rudder_max=0.6,
@@ -160,10 +182,11 @@ class AUVEnv(embodied.Env):
         goal_center=(10.0, 10.0),
         goal_radius=6.0,
         goal_speed=0.3,
+        goal_delay_steps = 5,
 
         # AUV 自身最大速度 / 角速度
-        max_auv_speed=3.0,
-        max_auv_turn_rate=1.0,
+        max_auv_speed=5.0,
+        max_auv_turn_rate=3.0,
 
         # 目标最大速度 / 角速度
         max_goal_speed=0.5,
@@ -178,13 +201,38 @@ class AUVEnv(embodied.Env):
         goal_custom_fn=None,
 
         # === Reward 中能量 / 平滑项 ===
-        energy_thrust_coef=5e-3,
+        energy_thrust_coef=1e-2,
         energy_rudder_coef=1e-2,
         smooth_ctrl_coef=1e-2,
-        smooth_vel_coef=5e-2,
+        smooth_vel_coef=1e-1,
+
+        # === Reward 相关可调参数（用于 PBT / 超参搜索） ===
+        base_k_progress=2.0,
+        k_dist=1.0,
+        k_ring=0.4,
+        bonus_max=1.5,
+        hold_bonus=0.5,
+        k_speed_near=0.3,
+        gamma_far=0.5,
+        k_heading_base=0.4,
+
+        # === TD 参数 ===
+        td_r=1.0,
+        td_N=8.0,
+
+        # === Debug / overshoot ===
+        seed=0,
+        debug_trace=False,
+        trace_dir="",
+        save_trace_on_done=True,
+        save_trace_on_overshoot=True,
+        overshoot_eps=0.2,
+        overshoot_min_steps=20,
+        overshoot_require_distdot=True,   # True: 需要 dist_dot_td>0 才算回弹
         **kwargs,
     ):
         del task, kwargs
+
         self.dt = float(dt)
         self.max_steps = int(max_steps)
         self.success_radius = float(success_radius)
@@ -197,72 +245,95 @@ class AUVEnv(embodied.Env):
         self.goal_radius = float(goal_radius)
         self.goal_speed = float(goal_speed)
 
-        # AUV 速度约束
         self.max_auv_speed = float(max_auv_speed)
         self.max_auv_turn_rate = float(max_auv_turn_rate)
 
-        # 目标速度约束
         self.max_goal_speed = float(max_goal_speed)
         self.max_goal_turn_rate = float(max_goal_turn_rate)
 
-        # 目标控制尺度和更新策略
         self.goal_thrust_scale = float(goal_thrust_scale)
         self.goal_rudder_max = float(goal_rudder_max)
         self.goal_ctrl_interval = int(goal_ctrl_interval)
         self.goal_ctrl_smooth = float(goal_ctrl_smooth)
-
         self.goal_custom_fn = goal_custom_fn
+        self.goal_delay_steps = int(goal_delay_steps)
+        self._goal_hist = deque(maxlen=max(1, self.goal_delay_steps + 1))
+
+        self.goal_live = np.zeros(2, dtype=float)   # 当前真实移动目标（用于生成轨迹）
+        # self.goal 继续保留，但语义改成：给 agent 跟踪的“参考目标”（延迟后的点）
+
+
         self.energy_thrust_coef = float(energy_thrust_coef)
         self.energy_rudder_coef = float(energy_rudder_coef)
         self.smooth_ctrl_coef = float(smooth_ctrl_coef)
         self.smooth_vel_coef = float(smooth_vel_coef)
 
+        self.base_k_progress = float(base_k_progress)
+        self.k_dist = float(k_dist)
+        self.k_ring = float(k_ring)
+        self.bonus_max = float(bonus_max)
+        self.hold_bonus = float(hold_bonus)
+        self.k_speed_near = float(k_speed_near)
+        self.gamma_far = float(gamma_far)
+        self.k_heading_base = float(k_heading_base)
+
+        self.td_r = float(td_r)
+        self.td_N = float(td_N)
+
+        # RNG
+        self.seed = int(seed)
+        self.np_random = np.random.RandomState(self.seed)
+
+        # 状态缓存
         self.prev_control = np.zeros(2, dtype=float)
         self.prev_vel = np.zeros(3, dtype=float)
-        self.prev_dist = None        # 上一步“平滑后距离”
+        self.prev_dist = None
 
         self.steps = 0
         self.done = False
-        self.np_random = np.random.RandomState(0)
 
-        # AUV 自身状态
         self.state_pos = np.zeros(3, dtype=float)   # [x, y, theta]
         self.state_vel = np.zeros(3, dtype=float)   # [u, v, r]
 
-        # 目标“外部”坐标（世界系）
         self.goal = np.zeros(2, dtype=float)
-
-        # 目标内部动力学状态
-        self.goal_pos = np.zeros(3, dtype=float)  # [x, y, theta]
-        self.goal_vel = np.zeros(3, dtype=float)  # [u, v, r]
-
-        # 目标控制内部状态
-        self.goal_control = np.zeros(2, dtype=float)  # [Xprop_g, deltar_g]
+        self.goal_pos = np.zeros(3, dtype=float)
+        self.goal_vel = np.zeros(3, dtype=float)
+        self.goal_control = np.zeros(2, dtype=float)
         self.goal_ctrl_step = 0
 
-        # 时间
         self.time = 0.0
 
-        # === New: 距离 TD ===
-        self.td_dist = TrackingDifferentiator(
-            r=2.0,
-            h=self.dt,
-            N=5.0,
-        )
+        # 距离 TD
+        self.td_dist = TrackingDifferentiator(r=self.td_r, h=self.dt, N=self.td_N)
+
+        # ===== overshoot / trace =====
+        self.debug_trace = bool(debug_trace)
+        self.trace_dir = str(trace_dir) if trace_dir else ""
+        self.save_trace_on_done = bool(save_trace_on_done)
+        self.save_trace_on_overshoot = bool(save_trace_on_overshoot)
+        self.overshoot_eps = float(overshoot_eps)
+        self.overshoot_min_steps = int(overshoot_min_steps)
+        self.overshoot_require_distdot = bool(overshoot_require_distdot)
+
+        self._episode_id = 0
+        self._trace = []
+        self._overshoot = None       # dict or None
+        self._min_dist_td = None     # float
+        self._saved_trace = False
+
+        if self.debug_trace and self.trace_dir:
+            Path(self.trace_dir).mkdir(parents=True, exist_ok=True)
 
     # === 目标轨迹（动力学 + 平滑随机控制）===
     def _goal_traj(self, t):
-        # 用户自定义轨迹优先
         if self.goal_custom_fn is not None:
             gx, gy = self.goal_custom_fn(t)
             return np.array([gx, gy], dtype=float)
 
-        # ---- 控制更新（平滑随机）----
         if self.goal_ctrl_step % self.goal_ctrl_interval == 0:
             noise = self.np_random.uniform(-1.0, 1.0, size=2)
             target_ctrl = np.array(
-                [noise[0] * self.goal_thrust_scale,
-                 noise[1] * self.goal_rudder_max],
+                [noise[0] * self.goal_thrust_scale, noise[1] * self.goal_rudder_max],
                 dtype=float,
             )
             self.goal_control = (
@@ -273,38 +344,68 @@ class AUVEnv(embodied.Env):
         self.goal_ctrl_step += 1
         control_g = self.goal_control
 
-        # ---- 动力学推进目标速度 ----
         self.goal_vel = update_model_state_dyn(self.goal_vel, control_g, self.dt)
 
-        # 速度裁剪
         self.goal_vel[0] = np.clip(self.goal_vel[0], -self.max_goal_speed, self.max_goal_speed)
         self.goal_vel[1] = np.clip(self.goal_vel[1], -self.max_goal_speed, self.max_goal_speed)
         self.goal_vel[2] = np.clip(self.goal_vel[2], -self.max_goal_turn_rate, self.max_goal_turn_rate)
 
-        # ---- 运动学推进目标位置 ----
         self.goal_pos = update_model_state_kine(self.goal_pos, self.goal_vel, self.dt)
-
-        # 返回世界系中的 (x, y)
         return self.goal_pos[:2].copy()
 
     # === Dreamer 接口定义 ===
     @property
     def obs_space(self):
-        # 15 维： [xb, yb, dist, cosθ, sinθ, u, v, r, x, y, gx, gy, phase_cos, phase_sin, t_norm]
+        scalar_f = elements.Space(np.float32, ())
         return {
             "vector": elements.Space(np.float32, (15,)),
-            "reward": elements.Space(np.float32),
-            "is_first": elements.Space(bool),
-            "is_last": elements.Space(bool),
-            "is_terminal": elements.Space(bool),
+            "reward": scalar_f,
+            "is_first": elements.Space(bool, ()),
+            "is_last": elements.Space(bool, ()),
+            "is_terminal": elements.Space(bool, ()),
+
+            # ---- per-step diagnostics (won't be used by world model) ----
+            "log/dist": scalar_f,
+            "log/dist_td": scalar_f,
+            "log/dist_dot_td": scalar_f,
+            "log/min_dist_td": scalar_f,
+            "log/heading_err": scalar_f,
+
+            "log/Xprop": scalar_f,
+            "log/deltar": scalar_f,
+            "log/u": scalar_f,
+            "log/v": scalar_f,
+            "log/r": scalar_f,
+
+            "log/r_progress": scalar_f,
+            "log/r_heading": scalar_f,
+            "log/r_dist": scalar_f,
+            "log/goal_bonus": scalar_f,
+            "log/hold_bonus": scalar_f,
+            "log/energy_cost": scalar_f,
+            "log/smooth_cost_ctrl": scalar_f,
+            "log/smooth_cost_vel": scalar_f,
+            "log/speed_cost_near": scalar_f,
+            "log/ring_cost": scalar_f,
+
+            # ---- overshoot detector output ----
+            "log/overshoot": scalar_f,
+            "log/overshoot_x": scalar_f,
+            "log/overshoot_y": scalar_f,
+            "log/overshoot_gx": scalar_f,
+            "log/overshoot_gy": scalar_f,
         }
 
     @property
     def act_space(self):
         return {
-            "reset": elements.Space(bool),
+            "reset": elements.Space(bool, ()),
             "action": elements.Space(np.float32, (2,), -1.0, 1.0),
         }
+
+    def close(self):
+        # optional hook
+        pass
 
     def _parse_action(self, action):
         a = action.get("action", action)
@@ -317,31 +418,76 @@ class AUVEnv(embodied.Env):
         deltar = float(self.rudder_max * a[1])
         return Xprop, deltar
 
+    # ===== trace helpers =====
+
+    def _trace_append(self, row: dict):
+        if not self.debug_trace:
+            return
+        self._trace.append(row)
+
+    def _save_trace(self, reason: str):
+        if (not self.debug_trace) or self._saved_trace:
+            return
+        if not self.trace_dir:
+            return
+        try:
+            outdir = Path(self.trace_dir)
+            outdir.mkdir(parents=True, exist_ok=True)
+            base = f"ep{self._episode_id:06d}_{reason}"
+            csv_path = outdir / f"{base}.csv"
+            meta_path = outdir / f"{base}.meta.txt"
+
+            # CSV
+            if self._trace:
+                keys = list(self._trace[0].keys())
+                with open(csv_path, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=keys)
+                    w.writeheader()
+                    for r in self._trace:
+                        w.writerow(r)
+
+            # meta
+            with open(meta_path, "w") as f:
+                f.write(f"episode_id: {self._episode_id}\n")
+                f.write(f"reason: {reason}\n")
+                f.write(f"seed: {self.seed}\n")
+                f.write(f"overshoot_eps: {self.overshoot_eps}\n")
+                f.write(f"overshoot_min_steps: {self.overshoot_min_steps}\n")
+                f.write(f"overshoot: {self._overshoot}\n")
+
+            self._saved_trace = True
+        except Exception as e:
+            print(f"[AUVEnv] WARNING: failed to save trace: {e}")
+
     # === step ===
     def step(self, action):
         if action.get("reset", False) or self.done:
             return self._reset()
 
-        # 时间推进
         self.time += self.dt
 
-        # --------- 目标动力学推进 ----------
+        # --------- 目标动力学推进（真实目标） ----------
         if self.moving_goal:
-            self.goal = self._goal_traj(self.time)
+            self.goal_live = self._goal_traj(self.time)
+        else:
+            # 静态目标：goal_live 就等于当前 goal
+            self.goal_live = self.goal.copy()
+
+        # 写入历史并取 delay 步之前的参考点
+        self._goal_hist.append(self.goal_live.copy())
+        self.goal = self._goal_hist[0].copy()   # 这一步之后，reward/obs 用的都是“延迟目标”
+
 
         # --------- AUV 动力学推进 ----------
         Xprop, deltar = self._parse_action(action)
         control = np.array([Xprop, deltar], dtype=float)
 
-        # 动力学更新速度
         self.state_vel = update_model_state_dyn(self.state_vel, control, self.dt)
 
-        # AUV 速度裁剪
         self.state_vel[0] = np.clip(self.state_vel[0], -self.max_auv_speed, self.max_auv_speed)
         self.state_vel[1] = np.clip(self.state_vel[1], -self.max_auv_speed, self.max_auv_speed)
         self.state_vel[2] = np.clip(self.state_vel[2], -self.max_auv_turn_rate, self.max_auv_turn_rate)
 
-        # 运动学更新位置
         self.state_pos = update_model_state_kine(self.state_pos, self.state_vel, self.dt)
 
         # === 误差：在船体坐标系下表示目标位置 ===
@@ -350,50 +496,48 @@ class AUVEnv(embodied.Env):
         # TD 平滑距离
         dist_td, dist_dot_td = self.td_dist.step(dist)
 
-        # 轨迹相位 + 归一化时间
-        phase = self.goal_speed * self.time
+        time_ref = max(0.0, self.time - self.goal_delay_steps * self.dt)
+        phase = self.goal_speed * time_ref
         phase_cos = math.cos(phase)
         phase_sin = math.sin(phase)
+
         t_norm = self.time / (self.max_steps * self.dt + 1e-6)
 
-                # ========== Reward 计算开始 ==========
+        # ========== Reward 计算开始 ==========
         eps = 1e-6
 
-        # 1) 用 TD 平滑距离做“进度”奖励
         if self.prev_dist is None:
             self.prev_dist = dist_td
-        progress = self.prev_dist - dist_td          # >0: 靠近目标
+        progress = self.prev_dist - dist_td
         self.prev_dist = dist_td
 
-        base_k_progress = 4.0
+        base_k_progress = self.base_k_progress
 
-        # 2) 以 success_radius 为尺度的距离归一化（0 附近更敏感）
-        #    rho = dist_td / R, 只关心 0~3R 的范围
-        rho = dist_td / (self.success_radius + eps)
-        rho = np.clip(rho, 0.0, 3.0)
-        gamma = 0.6                                   # 0<gamma<1，越小近零越敏感
-        dist_norm = (rho / 3.0) ** gamma             # ∈[0,1]，0=贴着目标，1≈3R
+        radius_ref_far = max(2.0 * self.goal_radius, 1e-6)
+        x_far = np.clip(dist_td / radius_ref_far, 0.0, 1.0)
+        gamma_far = self.gamma_far
+        dist_norm_far = x_far ** gamma_far
 
-        # 3) 航向项：距离相关的权重（远处大一点，近处显著变小）
-        heading_err = math.atan2(yb, xb)             # 0 表示目标在正前方
-        k_heading_base = 0.3
-        heading_scale = 0.3 + 0.7 * dist_norm        # dist_norm=0→0.3, =1→1.0
+        radius_ref_near = max(self.success_radius, 1e-6)
+        x_near = np.clip(dist_td / radius_ref_near, 0.0, 2.0)
+        dist_norm_near = x_near
+
+        heading_err = math.atan2(yb, xb)
+        k_heading_base = self.k_heading_base
+        heading_scale = 0.4 + 0.6 * dist_norm_far
         k_heading_eff = k_heading_base * heading_scale
-
         raw_cos = math.cos(heading_err)
-        cos_clipped = max(raw_cos, 0.0)              # 只奖励“朝前”，背对不额外强罚
+        cos_clipped = max(raw_cos, -0.3)
         r_heading = k_heading_eff * cos_clipped
 
-        # 4) 绝对距离项（惩罚离目标太远的状态）
-        k_dist = 0.5
-        r_dist = -k_dist * dist_norm                 # 近处 ≈ 0，远处 ≈ -0.5
+        k_dist = self.k_dist
+        r_dist = -k_dist * dist_norm_near
 
-        # 5) progress：越靠近目标权重越大，鼓励贴着目标微调
-        #    dist_norm=0（很近）→ k≈4.8；dist_norm≈1（3R）→ k≈4.0
-        k_progress = base_k_progress * (1.2 - 0.2 * dist_norm)
-        r_progress = k_progress * progress
+        dist_norm_clip = np.clip(dist_norm_near, 0.0, 1.0)
+        k_progress = base_k_progress * (1.3 - 0.3 * dist_norm_clip)
+        s = 0.03
+        r_progress = k_progress * math.tanh(progress / s) * s
 
-        # ---------- 能量和速度惩罚 ----------
         norm_thrust = Xprop / (self.thrust_scale + eps)
         norm_rudder = deltar / (self.rudder_max + eps)
         base_energy_cost = (
@@ -410,89 +554,136 @@ class AUVEnv(embodied.Env):
         du = self.state_vel[0] - self.prev_vel[0]
         dv = self.state_vel[1] - self.prev_vel[1]
         dr = self.state_vel[2] - self.prev_vel[2]
-
-        # 速度平滑基准项（整体比控制平滑重一些）
         base_smooth_cost_vel = 2.0 * self.smooth_vel_coef * (du**2 + dv**2 + dr**2)
 
-        # --------- 距离相关的缩放：越靠近目标惩罚越大 ---------
-        # 能量和控制平滑：远处惩罚较小，近处明显加重
-        #   dist_norm=1(≈3R) → energy_scale≈1.0，smooth_ctrl_scale≈1.0
-        #   dist_norm=0(贴近) → energy_scale≈2.5，smooth_ctrl_scale≈4.0
-        energy_scale      = 1.0 + 1.5 * (1.0 - dist_norm)
-        smooth_ctrl_scale = 1.0 + 3.0 * (1.0 - dist_norm)
+        energy_scale = 1.0 + 2.0 * dist_norm_far
+        smooth_ctrl_scale = 1.0 + 3.0 * dist_norm_far
 
-        # 绝对速度惩罚（靠近目标时不希望速度太大）
-        speed2 = (
-            self.state_vel[0]**2
-            + self.state_vel[1]**2
-            + self.state_vel[2]**2
-        )
-        # near：在 3R 以内逐渐启动，越靠近 R 越强
+        a_vel_far = 0.5
+        b_vel_near = 4.0
+
+        speed2 = self.state_vel[0]**2 + self.state_vel[1]**2 + self.state_vel[2]**2
         near = np.clip(
-            (3.0 * self.success_radius - dist_td)
-            / (3.0 * self.success_radius + eps),
-            0.0, 1.0,
+            (1.5 * self.success_radius - dist_td) / (1.5 * self.success_radius + eps),
+            0.0, 1.0
         )
-        k_speed_near = 0.6     # 比之前略大，靠近目标时明显压速度
+        k_speed_near = self.k_speed_near
         speed_cost_near = k_speed_near * near * speed2
 
-        # 速度平滑缩放：远处有轻微惩罚，近处明显增强
-        a_vel_far  = 0.5       # 远处附加系数
-        b_vel_near = 5.0       # 近处附加系数（可在 4~6 间微调）
+        smooth_vel_scale = 1.0 + a_vel_far * dist_norm_far + b_vel_near * near * (1.0 - dist_norm_far)
 
-        # dist_norm：0 近，1 远; near：0 远，1 很近
-        smooth_vel_scale = (
-            1.0
-            + a_vel_far  * dist_norm
-            + b_vel_near * near * (1.0 - dist_norm)
-        )
-
-        energy_cost      = energy_scale      * base_energy_cost
+        energy_cost = energy_scale * base_energy_cost
         smooth_cost_ctrl = smooth_ctrl_scale * base_smooth_cost_ctrl
-        smooth_cost_vel  = smooth_vel_scale  * base_smooth_cost_vel
+        smooth_cost_vel = smooth_vel_scale * base_smooth_cost_vel
 
-        # 6) 目标附近的额外奖励 + “停留奖励”
+        ring_cost = 0.0
+        if dist_td > self.success_radius:
+            t_ring = np.clip((dist_td - self.success_radius) / self.success_radius, 0.0, 1.0)
+            k_ring = self.k_ring
+            ring_cost = k_ring * (t_ring**2)
+
         goal_bonus = 0.0
         hold_bonus = 0.0
         if dist_td < self.success_radius:
-            bonus_max = 1.5
+            bonus_max = self.bonus_max
             proximity = 1.0 - dist_td / (self.success_radius + eps)
             goal_bonus = bonus_max * proximity
+            hold_bonus = self.hold_bonus
 
-            # 在成功区域内每一步额外给一点奖励，鼓励停在目标附近
-            hold_bonus = 0.5
+            energy_cost *= 0.7
+            smooth_cost_ctrl *= 0.7
+            smooth_cost_vel *= 0.7
 
-        # 7) 汇总 reward
         reward = (
-            r_progress
-            + r_heading
-            + r_dist
-            + goal_bonus
-            + hold_bonus
-            - energy_cost
-            - smooth_cost_ctrl
-            - smooth_cost_vel
-            - speed_cost_near
+            r_progress + r_heading + r_dist
+            + goal_bonus + hold_bonus
+            - energy_cost - smooth_cost_ctrl - smooth_cost_vel
+            - speed_cost_near - ring_cost
         )
         reward = float(np.clip(reward, -10.0, 10.0))
         # ========== Reward 计算结束 ==========
 
+        # ===== overshoot detector =====
+        if self._min_dist_td is None:
+            self._min_dist_td = float(dist_td)
+        else:
+            self._min_dist_td = min(self._min_dist_td, float(dist_td))
 
+        if (self._overshoot is None) and (self.steps >= self.overshoot_min_steps):
+            cond = (dist_td > self._min_dist_td + self.overshoot_eps)
+            if self.overshoot_require_distdot:
+                cond = cond and (dist_dot_td > 0.0)
+            if cond:
+                self._overshoot = {
+                    "t": float(self.time),
+                    "step": int(self.steps),
+                    "x": float(self.state_pos[0]),
+                    "y": float(self.state_pos[1]),
+                    "theta": float(self.state_pos[2]),
+                    "u": float(self.state_vel[0]),
+                    "v": float(self.state_vel[1]),
+                    "r": float(self.state_vel[2]),
+                    "gx": float(self.goal[0]),
+                    "gy": float(self.goal[1]),
+                    "dist_td": float(dist_td),
+                    "dist_dot_td": float(dist_dot_td),
+                    "Xprop": float(Xprop),
+                    "deltar": float(deltar),
+                    "heading_err": float(heading_err),
+                }
+                if self.save_trace_on_overshoot:
+                    self._save_trace("overshoot")
 
-        # 轨迹跟踪任务：只按步数结束（任务不变）
+        # ===== trace append (every step) =====
+        self._trace_append({
+            "t": float(self.time),
+            "step": int(self.steps),
+            "x": float(self.state_pos[0]),
+            "y": float(self.state_pos[1]),
+            "theta": float(self.state_pos[2]),
+            "u": float(self.state_vel[0]),
+            "v": float(self.state_vel[1]),
+            "r": float(self.state_vel[2]),
+            "gx": float(self.goal[0]),
+            "gy": float(self.goal[1]),
+            "xb": float(xb),
+            "yb": float(yb),
+            "dist": float(dist),
+            "dist_td": float(dist_td),
+            "dist_dot_td": float(dist_dot_td),
+            "min_dist_td": float(self._min_dist_td if self._min_dist_td is not None else np.nan),
+            "heading_err": float(heading_err),
+            "Xprop": float(Xprop),
+            "deltar": float(deltar),
+            "r_progress": float(r_progress),
+            "r_heading": float(r_heading),
+            "r_dist": float(r_dist),
+            "goal_bonus": float(goal_bonus),
+            "hold_bonus": float(hold_bonus),
+            "energy_cost": float(energy_cost),
+            "smooth_cost_ctrl": float(smooth_cost_ctrl),
+            "smooth_cost_vel": float(smooth_cost_vel),
+            "speed_cost_near": float(speed_cost_near),
+            "ring_cost": float(ring_cost),
+            "reward": float(reward),
+            "overshoot": float(1.0 if self._overshoot is not None else 0.0),
+        })
+
+        # 结束条件
         self.steps += 1
         if self.steps >= self.max_steps:
             self.done = True
 
-        # 更新 prev_* 供下一步使用
+        if self.done and self.save_trace_on_done:
+            self._save_trace("done")
+
+        # 更新 prev_*
         self.prev_control = control.copy()
         self.prev_vel = self.state_vel.copy()
 
         obs = np.array(
             [
-                xb,
-                yb,
-                dist,  # 这里仍然输出原始 dist，TD 只在内部用
+                xb, yb, dist,
                 math.cos(self.state_pos[2]),
                 math.sin(self.state_pos[2]),
                 self.state_vel[0],
@@ -502,12 +693,20 @@ class AUVEnv(embodied.Env):
                 self.state_pos[1],
                 self.goal[0],
                 self.goal[1],
-                phase_cos,
-                phase_sin,
-                t_norm,
+                phase_cos, phase_sin, t_norm,
             ],
             dtype=np.float32,
         )
+
+        # overshoot log fields
+        o_flag = 1.0 if (self._overshoot is not None) else 0.0
+        if self._overshoot is None:
+            ox = oy = ogx = ogy = np.nan
+        else:
+            ox = self._overshoot["x"]
+            oy = self._overshoot["y"]
+            ogx = self._overshoot["gx"]
+            ogy = self._overshoot["gy"]
 
         return dict(
             vector=obs,
@@ -515,14 +714,46 @@ class AUVEnv(embodied.Env):
             is_first=False,
             is_last=self.done,
             is_terminal=False,
+
+            **{
+                "log/dist": np.float32(dist),
+                "log/dist_td": np.float32(dist_td),
+                "log/dist_dot_td": np.float32(dist_dot_td),
+                "log/min_dist_td": np.float32(self._min_dist_td if self._min_dist_td is not None else np.nan),
+                "log/heading_err": np.float32(heading_err),
+
+                "log/Xprop": np.float32(Xprop),
+                "log/deltar": np.float32(deltar),
+                "log/u": np.float32(self.state_vel[0]),
+                "log/v": np.float32(self.state_vel[1]),
+                "log/r": np.float32(self.state_vel[2]),
+
+                "log/r_progress": np.float32(r_progress),
+                "log/r_heading": np.float32(r_heading),
+                "log/r_dist": np.float32(r_dist),
+                "log/goal_bonus": np.float32(goal_bonus),
+                "log/hold_bonus": np.float32(hold_bonus),
+                "log/energy_cost": np.float32(energy_cost),
+                "log/smooth_cost_ctrl": np.float32(smooth_cost_ctrl),
+                "log/smooth_cost_vel": np.float32(smooth_cost_vel),
+                "log/speed_cost_near": np.float32(speed_cost_near),
+                "log/ring_cost": np.float32(ring_cost),
+
+                "log/overshoot": np.float32(o_flag),
+                "log/overshoot_x": np.float32(ox),
+                "log/overshoot_y": np.float32(oy),
+                "log/overshoot_gx": np.float32(ogx),
+                "log/overshoot_gy": np.float32(ogy),
+            }
         )
 
     def _reset(self):
+        # 如果上一局 trace 还没保存（比如你关了 done 保存但想保留），这里可按需保存
         self.steps = 0
         self.done = False
         self.time = 0.0
 
-        # 自身初始状态
+        # AUV 初始状态
         self.state_pos = np.array(
             [
                 self.np_random.uniform(0.0, 5.0),
@@ -563,12 +794,63 @@ class AUVEnv(embodied.Env):
             self.goal_vel = np.zeros(3, dtype=float)
             self.goal_control = np.zeros(2, dtype=float)
             self.goal_ctrl_step = 0
+        # --- init goal history for delayed tracking ---
+        self.goal_live = self.goal.copy()
+        self._goal_hist.clear()
+        for _ in range(self._goal_hist.maxlen):
+            self._goal_hist.append(self.goal_live.copy())
+
+        # 参考目标：队列最老的那个 = delay 步之前
+        self.goal = self._goal_hist[0].copy()
+
 
         xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
         # TD 初始化
         self.td_dist.reset(dist)
-        self.prev_dist = dist
+        self.prev_dist = float(dist)
+
+        # ===== init overshoot/trace =====
+        self._episode_id += 1
+        self._trace = []
+        self._overshoot = None
+        self._min_dist_td = float(dist)
+        self._saved_trace = False
+
+        # 初始帧也记一条
+        self._trace_append({
+            "t": float(self.time),
+            "step": int(self.steps),
+            "x": float(self.state_pos[0]),
+            "y": float(self.state_pos[1]),
+            "theta": float(self.state_pos[2]),
+            "u": float(self.state_vel[0]),
+            "v": float(self.state_vel[1]),
+            "r": float(self.state_vel[2]),
+            "gx": float(self.goal[0]),
+            "gy": float(self.goal[1]),
+            "xb": float(xb),
+            "yb": float(yb),
+            "dist": float(dist),
+            "dist_td": float(dist),
+            "dist_dot_td": 0.0,
+            "min_dist_td": float(dist),
+            "heading_err": float(math.atan2(yb, xb)),
+            "Xprop": 0.0,
+            "deltar": 0.0,
+            "r_progress": 0.0,
+            "r_heading": 0.0,
+            "r_dist": 0.0,
+            "goal_bonus": 0.0,
+            "hold_bonus": 0.0,
+            "energy_cost": 0.0,
+            "smooth_cost_ctrl": 0.0,
+            "smooth_cost_vel": 0.0,
+            "speed_cost_near": 0.0,
+            "ring_cost": 0.0,
+            "reward": 0.0,
+            "overshoot": 0.0,
+        })
 
         phase = self.goal_speed * self.time
         phase_cos = math.cos(phase)
@@ -577,9 +859,7 @@ class AUVEnv(embodied.Env):
 
         obs = np.array(
             [
-                xb,
-                yb,
-                dist,
+                xb, yb, dist,
                 math.cos(self.state_pos[2]),
                 math.sin(self.state_pos[2]),
                 self.state_vel[0],
@@ -596,10 +876,42 @@ class AUVEnv(embodied.Env):
             dtype=np.float32,
         )
 
+        # reset 时 log/* 也必须返回（否则 CheckSpaces 会报缺字段）
         return dict(
             vector=obs,
             reward=np.float32(0.0),
             is_first=True,
             is_last=False,
             is_terminal=False,
+
+            **{
+                "log/dist": np.float32(dist),
+                "log/dist_td": np.float32(dist),
+                "log/dist_dot_td": np.float32(0.0),
+                "log/min_dist_td": np.float32(dist),
+                "log/heading_err": np.float32(math.atan2(yb, xb)),
+
+                "log/Xprop": np.float32(0.0),
+                "log/deltar": np.float32(0.0),
+                "log/u": np.float32(self.state_vel[0]),
+                "log/v": np.float32(self.state_vel[1]),
+                "log/r": np.float32(self.state_vel[2]),
+
+                "log/r_progress": np.float32(0.0),
+                "log/r_heading": np.float32(0.0),
+                "log/r_dist": np.float32(0.0),
+                "log/goal_bonus": np.float32(0.0),
+                "log/hold_bonus": np.float32(0.0),
+                "log/energy_cost": np.float32(0.0),
+                "log/smooth_cost_ctrl": np.float32(0.0),
+                "log/smooth_cost_vel": np.float32(0.0),
+                "log/speed_cost_near": np.float32(0.0),
+                "log/ring_cost": np.float32(0.0),
+
+                "log/overshoot": np.float32(0.0),
+                "log/overshoot_x": np.float32(np.nan),
+                "log/overshoot_y": np.float32(np.nan),
+                "log/overshoot_gx": np.float32(np.nan),
+                "log/overshoot_gy": np.float32(np.nan),
+            }
         )

@@ -39,6 +39,12 @@ python -m scope.viewer --basedir ~/logdir/auv --port 8000
 后续可能多加入几项指标，实现当前轨迹跟踪图示展示
 
 
+# PBT部分
+确定reward结构后调参太多，采样PBT进行调参：
+```bash
+python pbt_auv.py
+```
+
 # 用于Chemistry
 api
 

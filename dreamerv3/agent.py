@@ -116,22 +116,89 @@ class Agent(embodied.jax.Agent):
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     kw = dict(training=False, single=True)
     reset = obs['is_first']
+
+    out = {}  # ✅ 永远先初始化，后面随便写
+
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
     dyn_carry, dyn_entry, feat = self.dyn.observe(
         dyn_carry, tokens, prevact, reset, **kw)
+
+    # ✅ decoder 一定要有默认值
+    recons = {}
     dec_entry = {}
-    if dec_carry:
-      dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
+    dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
+
     policy = self.pol(self.feat2tensor(feat), bdims=1)
     act = sample(policy)
-    out = {}
+
+    # ======== confidence gating (online) ========
+    # ✅ 正确读取你放在 env.auv 下的 conf 配置
+    conf_cfg = getattr(self.config, 'agent', self.config)
+
+    alpha       = f32(getattr(conf_cfg, 'conf_alpha', 2.0))
+    conf_min    = f32(getattr(conf_cfg, 'conf_min', 0.05))
+    # k_thrust    = f32(getattr(conf_cfg, 'conf_k_thrust', 0.15))
+    # k_rudder    = f32(getattr(conf_cfg, 'conf_k_rudder', 1.0))
+    # use_mix     = bool(getattr(conf_cfg, 'conf_use_mix', True))
+    # use_scale   = bool(getattr(conf_cfg, 'conf_use_scale', False))
+    conf_enable = bool(getattr(conf_cfg, 'conf_enable', True))
+
+    if conf_enable and ('vector' in recons):
+      pred_vec = recons['vector'].pred()
+      true_vec = obs['vector']
+
+      # 兼容 pred_vec 可能是 (B,1,D)
+      if pred_vec.ndim == true_vec.ndim + 1:
+        pred_vec = pred_vec[:, 0]
+      if true_vec.ndim == pred_vec.ndim + 1:
+        true_vec = true_vec[:, 0]
+
+      err = pred_vec - true_vec
+      mse = jnp.mean(err ** 2, axis=-1, keepdims=True)  # (B,1)
+
+      conf = jnp.exp(-alpha * mse)
+      conf = jnp.clip(conf, conf_min, 1.0)  # (B,1)
+
+      # ======== prev-action blending (no safe policy) ========
+      # prevact 是上一步 sample(policy) 的返回 dict，你在 carry 里保存了它
+      prev_a = prevact.get('action', act['action'])
+      prev_a = jnp.where(reset[..., None], jnp.zeros_like(prev_a), prev_a)
+
+      tau = f32(getattr(conf_cfg, 'conf_low_tau', 0.30))
+      eta_min = f32(getattr(conf_cfg, 'conf_low_eta_min', 0.05))
+      eta_max = f32(getattr(conf_cfg, 'conf_low_eta_max', 0.80))   # 注意：低置信区间内也不一定要到 1
+      gamma = f32(getattr(conf_cfg, 'conf_low_eta_gamma', 1.0))
+
+      low = (conf < tau)  # (B,1)
+      # 把 conf 映射到 [0,1]（仅在 low 区间有效）
+      x = jnp.clip(conf / tau, 0.0, 1.0)
+      eta = eta_min + (eta_max - eta_min) * (x ** gamma)          # (B,1)
+
+      a_low = prev_a + eta * (act['action'] - prev_a)
+      act['action'] = jnp.where(low, a_low, act['action'])
+
+      act['action'] = jnp.clip(act['action'], -1.0, 1.0)
+
+
+
+      # ✅ 强烈建议：训练时不要往 out 里加新 key（否则可能进 replay 触发 spaces assert）
+      # 如果你只想在 eval 看，就只在 mode=='eval' 时输出，且最好用 log/ 前缀
+      if mode == 'eval':
+        out['log/wm_conf'] = conf.squeeze(-1)
+        out['log/wm_mse_vec_policy'] = mse.squeeze(-1)
+
+    # finite
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
+
     carry = (enc_carry, dyn_carry, dec_carry, act)
-    if self.config.replay_context:
+
+    # ✅ replay_context 最稳：只在 train 时塞（避免 eval/其他 driver 场景污染/浪费）
+    if mode == 'train' and self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
+
     return carry, act, out
 
   def train(self, carry, data):
@@ -204,6 +271,21 @@ class Agent(embodied.jax.Agent):
         metrics['wm_mse_vec'] = wm_mse
         metrics['wm_rmse_vec'] = wm_rmse
         metrics['wm_acc_vec'] = acc
+
+        # ====== NEW: 训练期 confidence 指标（不会进 replay）======
+        conf_cfg = getattr(self.config, 'agent', self.config)
+        alpha = f32(getattr(conf_cfg, 'conf_alpha', 2.0))
+        conf_min = f32(getattr(conf_cfg, 'conf_min', 0.05))
+
+        # mse_bt: (B,T)
+        conf_bt = jnp.exp(-alpha * mse_bt)
+        conf_bt = jnp.clip(conf_bt, conf_min, 1.0)
+
+        metrics['wm_conf_mean'] = jnp.mean(conf_bt)
+        metrics['wm_conf_p10']  = jnp.quantile(conf_bt, 0.10)
+
+# ====== NEW end ======
+
       # ====== 新增部分结束 ======
 
     B, T = reset.shape

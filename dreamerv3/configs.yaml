@@ -20,8 +20,8 @@ defaults:
   errfile: False
 
   logger:
-    outputs: [jsonl, scope]
-    filter: 'score|length|fps|ratio|train/loss/|train/rand/|wm_'
+    outputs: [jsonl, scope, tensorboard]   # 推荐加 tensorboard
+    filter: 'score|length|fps|ratio|train/loss/|train/rand/|wm_|log/overshoot|log/dist_td|log/dist_dot_td|log/min_dist_td|log/heading_err'
     timer: True
     fps: 15
     user: ''
@@ -36,7 +36,32 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
-    auv: {size: [64, 64], repeat: 1, proprio: True, image: False}
+    auv:
+      size: [64, 64]
+      repeat: 1
+      
+      use_logdir: True
+      debug_trace: False
+      save_trace_on_done: True
+      save_trace_on_overshoot: True
+      overshoot_eps: 0.2
+      overshoot_min_steps: 20
+      overshoot_require_distdot: True
+
+      proprio: True
+      image: False
+
+      # 这里写上和 AUVEnv 一致的默认值
+      base_k_progress: 2.0
+      k_dist: 1.0
+      k_ring: 0.4
+      bonus_max: 1.5
+      hold_bonus: 0.5
+      k_speed_near: 0.3
+      gamma_far: 0.5
+      k_heading_base: 0.4
+      td_r: 1.0
+      td_N: 8.0
 
   replay:
     size: 5e6
@@ -118,6 +143,15 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
+     ===== confidence gating (policy-time) =====
+    conf_enable: true
+    conf_alpha: 0.34284611654502795
+    conf_min: 0.011655542514402845
+    conf_low_eta_min: 0.11434785526842392
+    conf_low_eta_max: 1.00
+    conf_low_eta_gamma: 1.3091640967023248
+    conf_low_tau: 0.4901353988897491
+
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
@@ -152,7 +186,7 @@ size200m: &size200m
 size400m: &size400m
   .*\.rssm: {deter: 12288, hidden: 1536, classes: 96}
   .*\.depth: 96
-  .*\.units: 1536`
+  .*\.units: 1536
 
 size_auv: &size_auv
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
@@ -205,14 +239,45 @@ loconav:
   run.train_ratio: 256
 
 auv:
-  <<: *size_auv          # 自己定义size_auv
+  <<: *size_auv
   task: auv_custom
-  env.auv.image: False   
-  env.auv.proprio: True  
+
+  # 所有 AUVEnv 的参数，统一放到 env: { auv: {...} } 下面
+  env:
+    auv:
+
+      # 让 make_env 给 env 传入每个 env 的 logdir（很关键，PBT 时每个实验单独落盘）
+      use_logdir: True
+
+      # 开 trace（建议只在 eval/调试时开，训练全开会产生大量 csv）
+      debug_trace: True
+      save_trace_on_done: True
+      save_trace_on_overshoot: True
+
+      # 过冲判定阈值（按你的距离尺度调）
+      overshoot_eps: 0.2
+      overshoot_min_steps: 20
+      overshoot_require_distdot: True   # 要求 dist_dot_td>0 才算“回弹”
+      image: False
+      proprio: True
+
+      # ===== PBT round3 best hyperparameters =====
+      base_k_progress: 5.0
+      k_dist: 0.6897387931279519
+      k_ring: 0.0
+      bonus_max: 2.4626454450201236
+      hold_bonus: 0.7043220508831907
+      k_speed_near: 0.43693174000367474
+      gamma_far: 1.0
+      k_heading_base: 0.260379918441288
+      td_r: 3.0
+      td_N: 12.0
+
   run:
     envs: 16
     steps: 1.0e8
-    train_ratio: 64     
+    train_ratio: 128
+    
 
 multicpu:
   batch_size: 12

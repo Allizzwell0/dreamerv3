@@ -2,56 +2,62 @@
 # -*- coding: utf-8 -*-
 """
 Evaluate a trained DreamerV3 policy on the (CONTINUOUS-ACTION) AUVEnv and export trajectories to CSV,
-along with summary metrics.
+along with summary metrics + overshoot detection.
 
 Usage:
   python eval_auv.py --ckpt ~/logdir/auv/20251106T161609 \
     --episodes 200 --out_dir ~/logdir/auv/20251106T161609/eval_output
 
-Notes:
-- This version assumes your AUVEnv uses CONTINUOUS actions (e.g. action ∈ [-1,1]^2).
-- If DreamerV3 checkpoint loading fails or isn't provided, a RandomContinuousPolicy is used.
-- obs['vector'] 约定结构（15 维）：
-    [0:3]  xb, yb, dist（目标在船体坐标系下的误差 + 距离）
-    [3:5]  cos(theta), sin(theta)
-    [5:8]  u, v, r
-    [8:10] x, y  （世界坐标）
-    [10:12] gx, gy
-    [12:14] phase_cos, phase_sin
-    [14]   t_norm
+New:
+- If checkpoint is provided, optionally build env from the training config.yaml (recommended).
+- Export TD distance diagnostics if env provides: log/dist_td, log/dist_dot_td
+- Detect first overshoot point per episode and save overshoots.json
+
+Overshoot definition (default):
+- Maintain min_dist_td so far; if after at least overshoot_min_steps since min,
+  dist_td rises above min_dist_td + overshoot_eps AND (optionally) dist_dot_td > 0,
+  then the first such step is marked as overshoot point.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
+import sys
 from pathlib import Path
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
 
 import numpy as np
 
-# ===== MODIFY THIS IMPORT TO MATCH YOUR ENV PATH =====
+# ----------------- path bootstrap (make `dreamerv3` importable when running as script) -----------------
+THIS = Path(__file__).resolve()
+ROOT = THIS.parent.parent if (THIS.parent.name == "dreamerv3") else THIS.parent
+# Typical layout:
+#   ROOT/
+#     dreamerv3/
+#       main.py
+#       eval_auv.py  (this file)
+#     embodied/
+sys.path.insert(0, str(ROOT))
+
+# ===== MODIFY THIS IMPORT TO MATCH YOUR ENV PATH (fallback mode) =====
 try:
     from embodied.envs.AUV_Env import AUVEnv
 except Exception as e:
-    raise ImportError(
-        "Failed to import AUVEnv. Please edit the import path in eval_auv.py "
-        "to point to your environment class.\n"
-        f"Original error: {e}"
-    )
+    AUVEnv = None
+    _AUV_IMPORT_ERR = e
 
 
 def _wrap_pi(a: float) -> float:
-    """Wrap angle to [-pi, pi]."""
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
-# ------------ 连续动作 fallback 策略 ------------
+# ------------ continuous-action fallback policy ------------
 
 class RandomContinuousPolicy:
-    """连续动作的 fallback 策略：action ∈ [low, high]^n."""
     def __init__(self, act_low, act_high, seed: int = 0):
         self.low = np.array(act_low, dtype=np.float32)
         self.high = np.array(act_high, dtype=np.float32)
@@ -66,7 +72,116 @@ class RandomContinuousPolicy:
         return {"reset": False, "action": a.astype(np.float32)}
 
 
-# ------------ 按 main + eval_only 风格加载 DreamerV3 agent 权重（连续动作） ------------
+# ----------------- checkpoint helpers -----------------
+
+def _looks_like_step_dir(p: Path) -> bool:
+    return (p / "manifest").exists() or (p / "checkpoint").exists()
+
+
+def resolve_ckpt_step_dir(ckpt_dir: str) -> Optional[Path]:
+    run_path = Path(ckpt_dir).expanduser().resolve()
+    if not run_path.exists():
+        return None
+
+    if run_path.is_dir() and _looks_like_step_dir(run_path):
+        return run_path
+
+    ckpt_root = run_path / "ckpt"
+    if not ckpt_root.exists() and run_path.name == "ckpt":
+        ckpt_root = run_path
+
+    if not ckpt_root.exists():
+        return None
+
+    subdirs = [d for d in ckpt_root.iterdir() if d.is_dir()]
+    if not subdirs:
+        return None
+    subdirs = sorted(subdirs)
+    return subdirs[-1]
+
+
+def find_config_yaml_near(step_dir: Path, max_up: int = 6) -> Optional[Path]:
+    probe = step_dir
+    for _ in range(max_up):
+        cand = probe / "config.yaml"
+        if cand.exists():
+            return cand
+        probe = probe.parent
+    return None
+
+
+def load_elements_config(config_path: Path):
+    import elements
+    import ruamel.yaml as yaml
+    raw_cfg = yaml.YAML(typ="safe").load(config_path.read_text(encoding="utf-8"))
+    cfg = elements.Config(raw_cfg)
+    # Use run root as logdir
+    cfg = cfg.update(logdir=str(config_path.parent))
+    return cfg
+
+
+# ----------------- build env (recommended) -----------------
+
+def build_env(
+    ckpt_dir: Optional[str],
+    *,
+    dt: float,
+    max_steps: int,
+    seed: int,
+    use_env_from_ckpt: bool,
+):
+    """
+    Recommended: if ckpt_dir provided and use_env_from_ckpt=True:
+      - read config.yaml
+      - use dreamerv3.main.make_env(config, index=0) to match training exactly
+    Fallback:
+      - construct AUVEnv directly
+    """
+    rng = np.random.default_rng(seed)
+    env_seed = int(rng.integers(0, 2**31 - 1))
+
+    if ckpt_dir and use_env_from_ckpt:
+        try:
+            step_dir = resolve_ckpt_step_dir(ckpt_dir)
+            if step_dir is None:
+                raise RuntimeError("Could not resolve checkpoint step dir.")
+            cfg_path = find_config_yaml_near(step_dir)
+            if cfg_path is None:
+                raise RuntimeError("config.yaml not found near checkpoint.")
+            cfg = load_elements_config(cfg_path)
+
+            from dreamerv3 import main as dv3_main
+            # Ensure eval uses same task/env config; override dt/max_steps if you want:
+            # NOTE: your AUVEnv __init__ must accept dt/max_steps as kwargs for this to work.
+            # If not, delete the overrides.
+            cfg = cfg.update(env=cfg.env)  # keep structure
+            # Make env with wrappers exactly like training
+            env = dv3_main.make_env(cfg, index=0, dt=dt, max_steps=max_steps)
+            # Seed: training env seeding uses use_seed; here we seed the underlying env if possible
+            if hasattr(env, "np_random"):
+                env.np_random.seed(env_seed)
+            np.random.seed(env_seed)
+            return env
+        except Exception as e:
+            print(f"[eval_auv] build_env_from_ckpt failed: {e}")
+            print("[eval_auv] Falling back to direct AUVEnv construction.")
+
+    # Fallback: direct env
+    if AUVEnv is None:
+        raise ImportError(
+            "AUVEnv import failed and env-from-ckpt also failed.\n"
+            "Please fix AUVEnv import path.\n"
+            f"Original import error: {_AUV_IMPORT_ERR}"
+        )
+
+    env = AUVEnv(dt=dt, max_steps=max_steps, moving_goal=True)
+    if hasattr(env, "np_random"):
+        env.np_random.seed(env_seed)
+    np.random.seed(env_seed)
+    return env
+
+
+# ----------------- load trained policy -----------------
 
 def load_trained_policy(
     checkpoint_dir: Optional[str],
@@ -75,105 +190,41 @@ def load_trained_policy(
     act_high,
     seed: int = 0,
 ):
-    """
-    连续动作版：
-    - 用 dreamerv3/main.py 里的 make_agent(config) 构造 Agent（和训练完全一致）
-    - 用 elements.Checkpoint() 加载 agent 权重（完全仿照 embodied/run/eval_only.py）
-    - 输出连续动作向量（直接传给 AUVEnv）
-
-    支持三种传参形式：
-      1) --ckpt 指向一个具体 step 目录（含 manifest/checkpoint 等）
-      2) --ckpt 指向 run_dir（里面有 ckpt/ 子目录）
-      3) --ckpt 指向 ckpt 目录本身
-    """
     if checkpoint_dir is None:
         print("[eval_auv] No checkpoint provided. Using RandomContinuousPolicy.")
         return RandomContinuousPolicy(act_low, act_high, seed)
 
-    run_path = Path(checkpoint_dir).expanduser().resolve()
-    if not run_path.exists():
-        print(f"[eval_auv] Checkpoint dir '{run_path}' does not exist. Using RandomContinuousPolicy.")
+    step_dir = resolve_ckpt_step_dir(checkpoint_dir)
+    if step_dir is None:
+        print(f"[eval_auv] Could not resolve checkpoint from '{checkpoint_dir}'. Using RandomContinuousPolicy.")
         return RandomContinuousPolicy(act_low, act_high, seed)
 
-    # -------- 0) 判断本身是否就是一个 step 目录（含 manifest/checkpoint） --------
-    def _looks_like_step_dir(p: Path) -> bool:
-        return (p / "manifest").exists() or (p / "checkpoint").exists()
-
-    load_path: Optional[Path] = None
-
-    if run_path.is_dir() and _looks_like_step_dir(run_path):
-        # 直接是某个 step 目录
-        load_path = run_path
-    else:
-        # -------- 1) 如果传的是 run_dir，优先找 run_dir/ckpt 下的子目录 --------
-        ckpt_root = run_path / "ckpt"
-        if not ckpt_root.exists():
-            # 也可能直接传的是 ckpt 目录本身
-            if run_path.name == "ckpt":
-                ckpt_root = run_path
-
-        if ckpt_root.exists():
-            subdirs = [d for d in ckpt_root.iterdir() if d.is_dir()]
-            if not subdirs:
-                print(f"[eval_auv] No checkpoint subdirectories found in '{ckpt_root}'. Using RandomContinuousPolicy.")
-                return RandomContinuousPolicy(act_low, act_high, seed)
-            subdirs = sorted(subdirs)
-            load_path = subdirs[-1]   # 按名字排序，最后一个一般是最新的 step
-
-    if load_path is None:
-        print(f"[eval_auv] Could not resolve a checkpoint step dir from '{run_path}'. Using RandomContinuousPolicy.")
+    cfg_path = find_config_yaml_near(step_dir)
+    if cfg_path is None:
+        print(f"[eval_auv] config.yaml not found near '{step_dir}'. Using RandomContinuousPolicy.")
         return RandomContinuousPolicy(act_low, act_high, seed)
 
-    print(f"[eval_auv] Using checkpoint step dir: {load_path}")
-
-    # -------- 找 config.yaml：从 load_path 往上爬，仿照 main.py 的结构 --------
-    config_path = None
-    probe = load_path
-    for _ in range(4):  # step -> ckpt -> run_dir -> 上一层
-        cand = probe / "config.yaml"
-        if cand.exists():
-            config_path = cand
-            break
-        probe = probe.parent
-
-    if config_path is None:
-        print(f"[eval_auv] config.yaml not found near '{load_path}'. Using RandomContinuousPolicy.")
-        return RandomContinuousPolicy(act_low, act_high, seed)
+    print(f"[eval_auv] Using checkpoint step dir: {step_dir}")
+    print(f"[eval_auv] Using config: {cfg_path}")
 
     try:
         import elements
-        import ruamel.yaml as yaml
         from dreamerv3 import main as dv3_main
 
-        # -------- 1) 读取 config.yaml -> elements.Config（与 main.py 一致）--------
-        cfg_text = config_path.read_text(encoding="utf-8")
-        raw_cfg = yaml.YAML(typ="safe").load(cfg_text)
-        config = elements.Config(raw_cfg)
+        config = load_elements_config(cfg_path)
 
-        # logdir 用 config.yaml 所在目录（一般就是 run_dir）
-        config_root = config_path.parent
-        config = config.update(logdir=str(config_root))
-
-        # -------- 2) 用 main 里的 make_agent 构造 Agent --------
+        # Build agent same as training
         agent = dv3_main.make_agent(config)
 
-        # -------- 3) 用 elements.Checkpoint 加载 agent 权重（仿照 eval_only）--------
+        # Load weights
         cp = elements.Checkpoint()
         cp.agent = agent
-        print(f"Loading checkpoint: {load_path}")
-        # 这里的 load_path 就相当于 eval_only 里的 args.from_checkpoint
-        cp.load(str(load_path), keys=['agent'])
-        print(f"[eval_auv] Loaded DreamerV3 agent weights from {load_path}")
+        cp.load(str(step_dir), keys=["agent"])
+        print(f"[eval_auv] Loaded DreamerV3 agent weights from {step_dir}")
 
-        # -------- 4) 连续动作封装：模仿 Driver 的调用方式 --------
         act_shape = tuple(act_shape)
 
         class ContinuousPolicyWrapper:
-            """
-            完全模仿 embodied.Driver 的用法：
-            carry, acts, outs = agent.policy(carry, obs, mode='eval')
-            只不过我们在这里自己维护 carry，而不是用 Driver。
-            """
             def __init__(self, agent_, act_shape_, seed_):
                 self.agent = agent_
                 self.act_shape = tuple(act_shape_)
@@ -181,66 +232,61 @@ def load_trained_policy(
                 self.rng = np.random.default_rng(seed_)
 
             def reset(self) -> None:
-                """
-                等价于 Driver.reset(init_policy)，只不过我们自己调一遍。
-                Driver 里是：
-                  self.carry = init_policy and init_policy(self.length)
-                这里 length=1（单环境），所以 batch_size=1。
-                """
-                try:
-                    self.carry = self.agent.init_policy(batch_size=1)
-                except TypeError:
-                    # 如果这个 Agent.init_policy 不要参数，就退化成无参
-                    self.carry = self.agent.init_policy()
+                self.carry = self.agent.init_policy(batch_size=1)
 
             def __call__(self, obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
                 if self.carry is None:
                     self.reset()
 
-                # Driver._step 里会把每个 env 的 obs 堆成 batch：
-                #   obs = {k: np.stack([x[k] for x in obs_list])}
-                # 我们只有1个 env，所以手动加 batch 维：(1, ...)
-                obs_batched = {k: np.asarray(v)[None] for k, v in obs.items()}
+                # IMPORTANT: filter obs keys to what agent expects
+                obs_filtered = {k: obs[k] for k in self.agent.obs_space if k in obs}
+                obs_batched = {k: np.asarray(v)[None] for k, v in obs_filtered.items()}
 
-                # 对齐 Driver 的调用方式：
-                #   self.carry, acts, outs = policy(self.carry, obs, ...)
-                self.carry, acts, outs = self.agent.policy(
-                    self.carry, obs_batched, mode="eval"
-                )
-
-                # acts 是一个 dict，key 和 env.act_space 对齐：
-                if not isinstance(acts, dict):
-                    raise RuntimeError(f"agent.policy() returned non-dict acts: {type(acts)}")
+                self.carry, acts, outs = self.agent.policy(self.carry, obs_batched, mode="eval")
 
                 if "action" not in acts:
                     raise RuntimeError(f"'action' not found in policy acts keys: {list(acts.keys())}")
 
                 act_arr = np.asarray(acts["action"], dtype=np.float32)
-
-                # 期望形状是 (1, act_dim) 或 (act_dim,)；统一取第 0 个 env
-                if act_arr.ndim == 1:
-                    act_vec = act_arr
-                elif act_arr.ndim >= 2:
-                    act_vec = act_arr[0]
-                else:
-                    raise RuntimeError(f"Unexpected action shape from policy: {act_arr.shape}")
-
-                # reshape 成期望形状，比如 (2,)
+                act_vec = act_arr[0] if act_arr.ndim >= 2 else act_arr
                 act_vec = act_vec.reshape(self.act_shape)
-                # 通常 Dreamer 的动作已经在 [-1, 1]，这里再裁一次保险
                 act_vec = np.clip(act_vec, -1.0, 1.0)
-
                 return {"reset": False, "action": act_vec}
 
         return ContinuousPolicyWrapper(agent, act_shape, seed)
 
     except Exception as e:
-        print(f"[eval_auv] Could not load DreamerV3 policy from '{run_path}': {e}")
+        print(f"[eval_auv] Could not load DreamerV3 policy: {e}")
         print("[eval_auv] Falling back to RandomContinuousPolicy.")
         return RandomContinuousPolicy(act_low, act_high, seed)
 
 
-# ------------ 评估循环：使用连续动作 policy 在 AUVEnv 上 rollout ------------
+# ----------------- overshoot detection -----------------
+
+def detect_first_overshoot(
+    *,
+    t: int,
+    dist_td: float,
+    dist_dot_td: float,
+    min_dist_td: float,
+    min_step: int,
+    overshoot_found: bool,
+    overshoot_eps: float,
+    overshoot_min_steps: int,
+    overshoot_require_distdot: bool,
+) -> bool:
+    if overshoot_found:
+        return False
+    if t - min_step < overshoot_min_steps:
+        return False
+    if dist_td <= min_dist_td + overshoot_eps:
+        return False
+    if overshoot_require_distdot and not (dist_dot_td > 0.0):
+        return False
+    return True
+
+
+# ----------------- main evaluate -----------------
 
 def evaluate_auv(
     ckpt_dir: Optional[str],
@@ -250,72 +296,55 @@ def evaluate_auv(
     max_steps: int = 800,
     success_threshold: float = 1.0,
     track_success_ratio: float = 0.8,
-    out_csv: Path,
+    out_dir: Path,
     seed: int = 0,
     verbose: bool = True,
+    use_env_from_ckpt: bool = True,
+    # overshoot params
+    overshoot_eps: float = 0.2,
+    overshoot_min_steps: int = 20,
+    overshoot_require_distdot: bool = True,
 ) -> Dict[str, float]:
-    """
-    Roll out multiple episodes, compute trajectory-tracking metrics, and write trajectories.
 
-    对于“轨迹跟踪”任务：
-      - 不再因为 dist <= success_threshold 提前结束 episode
-      - 每个 episode 统计：
-          mean_dist:  平均距离
-          max_dist:   最大距离
-          track_ratio:  有多少比例时间 dist <= success_threshold
-          rmse_x, rmse_y, rmse_heading: 不同自由度随时间的均方根误差
-      - success_flag: track_ratio >= track_success_ratio 视为“成功 episode”
-    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = out_dir / "trajectories.csv"
+    overshoot_json = out_dir / "overshoots.json"
 
     rng = np.random.default_rng(seed)
-    env = AUVEnv(
+
+    # Build env
+    env = build_env(
+        ckpt_dir,
         dt=dt,
         max_steps=max_steps,
-        moving_goal=True,             # ⭐ 开启移动目标
+        seed=seed,
+        use_env_from_ckpt=use_env_from_ckpt,
     )
 
-    # for reproducibility
-    env.np_random.seed(seed)
-    np.random.seed(seed)
-
-    # ---- 连续动作信息，从 env.act_space['action'] 中读取 ----
+    # Read action space from env (works with wrappers)
     act_space = env.act_space["action"]
-    act_shape = act_space.shape              # 例如 (2,)
+    act_shape = act_space.shape
     act_low = getattr(act_space, "low", -1.0)
     act_high = getattr(act_space, "high", 1.0)
 
-    # build policy AFTER we know action shape / range
     policy = load_trained_policy(ckpt_dir, act_shape, act_low, act_high, seed)
 
     header = [
-        "episode",
-        "t",
-        "reward",
-        "discount",
-        "x",
-        "y",
-        "theta",
-        "u",
-        "v",
-        "r",
-        "goal_x",
-        "goal_y",
-        "xe",        # body-frame 前向误差 xb
-        "ye",        # body-frame 侧向误差 yb
+        "episode", "t",
+        "reward", "discount",
+        "x", "y", "theta",
+        "u", "v", "r",
+        "goal_x", "goal_y",
+        "xe", "ye",
         "dist",
-        "err_x",     # world-frame x 误差: gx - x
-        "err_y",     # world-frame y 误差: gy - y
-        "err_heading",  # 航向误差（期望航向 - 实际 theta，wrap 到 [-pi,pi]）
-        "phase_cos",
-        "phase_sin",
-        "t_norm",
-        "action_0",   # 归一化动作 a[0]
-        "action_1",   # 归一化动作 a[1]
-        "is_terminal",
-        "is_last",
+        "dist_td", "dist_dot_td",
+        "min_dist_td_sofar",
+        "is_overshoot_step",
+        "err_x", "err_y", "err_heading",
+        "phase_cos", "phase_sin", "t_norm",
+        "action_0", "action_1",
+        "is_terminal", "is_last",
     ]
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     ep_returns: List[float] = []
     ep_lengths: List[int] = []
@@ -323,13 +352,12 @@ def evaluate_auv(
     mean_dists: List[float] = []
     max_dists: List[float] = []
     track_ratios: List[float] = []
-
-    # 新增：不同自由度误差的 RMSE（每个 episode 一个）
     rmse_x_list: List[float] = []
     rmse_y_list: List[float] = []
     rmse_heading_list: List[float] = []
-
     successes = 0
+
+    overshoot_records: List[Dict[str, Any]] = []
 
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -337,92 +365,44 @@ def evaluate_auv(
 
         for ep in range(episodes):
             policy.reset()
-            # resample env target/initialization for diversity
+
+            # resample env randomness per episode
             env_seed = int(rng.integers(0, 2**31 - 1))
-            env.np_random.seed(env_seed)
-            traj = env.step({"reset": True})
+            if hasattr(env, "np_random"):
+                env.np_random.seed(env_seed)
+            np.random.seed(env_seed)
 
-            vec = traj["vector"]
-            theta = float(math.atan2(vec[4], vec[3]))
-            u, v, r_val = map(float, vec[5:8])
-            xe, ye, dist = map(float, vec[:3])
+            zero_act = np.zeros(act_shape, dtype=np.float32)
+            traj = env.step({"reset": True, "action": zero_act})  
 
-            x = y = goal_x = goal_y = float("nan")
-            phase_cos = phase_sin = t_norm = float("nan")
-
-            if len(vec) >= 12:
-                x, y = float(vec[8]), float(vec[9])
-                goal_x, goal_y = float(vec[10]), float(vec[11])
-            if len(vec) >= 15:
-                phase_cos = float(vec[12])
-                phase_sin = float(vec[13])
-                t_norm = float(vec[14])
-
-            # === 初始时刻的自由度误差 ===
-            if not (math.isnan(x) or math.isnan(y) or math.isnan(goal_x) or math.isnan(goal_y)):
-                err_x = goal_x - x
-                err_y = goal_y - y
-                desired_heading = math.atan2(goal_y - y, goal_x - x)
-                err_heading = _wrap_pi(desired_heading - theta)
-            else:
-                err_x = err_y = err_heading = float("nan")
-
-            # t=0 时还没有动作，记 nan
-            writer.writerow(
-                [
-                    ep, 0, 0.0, 1.0,
-                    x, y, theta, u, v, r_val,
-                    goal_x, goal_y, xe, ye, dist,
-                    err_x, err_y, err_heading,
-                    phase_cos, phase_sin, t_norm,
-                    float("nan"), float("nan"),
-                    False, False,
-                ]
-            )
 
             ep_return = 0.0
-            final_dist = dist
             steps = 0
 
-            # 收集本 episode 的所有 dist，用于统计 mean_dist / max_dist / track_ratio
-            ep_dists_step: List[float] = [dist]
-
-            # 用于计算不同自由度随时间的 RMSE
-            sum_ex2 = 0.0
-            sum_ey2 = 0.0
-            sum_hd2 = 0.0
+            # stats buffers
+            ep_dists_step: List[float] = []
+            sum_ex2 = sum_ey2 = sum_hd2 = 0.0
             count_err = 0
 
-            if not math.isnan(err_x):
-                sum_ex2 += err_x * err_x
-                sum_ey2 += err_y * err_y
-                sum_hd2 += err_heading * err_heading
-                count_err += 1
+            # overshoot trackers
+            overshoot_found = False
+            overshoot_step = None
+            overshoot_payload = None
 
-            for t in range(1, max_steps + 1):
+            min_dist_td = float("inf")
+            min_step = 0
+            prev_dist_td = None
+
+            for t in range(0, max_steps + 1):
                 steps = t
-                # 连续动作策略：返回 {"reset": False, "action": np.array(shape=act_shape)}
-                action = policy(traj)
 
-                # 记录归一化动作（用于后处理分析）
-                raw_act = np.asarray(action.get("action", np.zeros(act_shape)), dtype=float).reshape(-1)
-                if raw_act.size == 1:
-                    raw_act = np.array([raw_act.item(), 0.0], dtype=float)
-                elif raw_act.size >= 2:
-                    raw_act = raw_act[:2]
-                else:
-                    raw_act = np.zeros(2, dtype=float)
-
-                traj = env.step(action)
                 vec = traj["vector"]
-
                 theta = float(math.atan2(vec[4], vec[3]))
                 u, v, r_val = map(float, vec[5:8])
                 xe, ye, dist = map(float, vec[:3])
 
                 x = y = goal_x = goal_y = float("nan")
                 phase_cos = phase_sin = t_norm = float("nan")
-
                 if len(vec) >= 12:
                     x, y = float(vec[8]), float(vec[9])
                     goal_x, goal_y = float(vec[10]), float(vec[11])
@@ -431,13 +411,29 @@ def evaluate_auv(
                     phase_sin = float(vec[13])
                     t_norm = float(vec[14])
 
-                # 自由度误差（世界坐标 + 航向）
+                # TD diagnostics (prefer env log keys)
+                dist_td = float(traj.get("log/dist_td", dist))
+                if "log/dist_dot_td" in traj:
+                    dist_dot_td = float(traj["log/dist_dot_td"])
+                else:
+                    if prev_dist_td is None:
+                        dist_dot_td = 0.0
+                    else:
+                        dist_dot_td = (dist_td - prev_dist_td) / max(dt, 1e-8)
+
+                prev_dist_td = dist_td
+
+                # update min
+                if dist_td < min_dist_td:
+                    min_dist_td = dist_td
+                    min_step = t
+
+                # errors (world frame)
                 if not (math.isnan(x) or math.isnan(y) or math.isnan(goal_x) or math.isnan(goal_y)):
                     err_x = goal_x - x
                     err_y = goal_y - y
                     desired_heading = math.atan2(goal_y - y, goal_x - x)
                     err_heading = _wrap_pi(desired_heading - theta)
-
                     sum_ex2 += err_x * err_x
                     sum_ey2 += err_y * err_y
                     sum_hd2 += err_heading * err_heading
@@ -445,69 +441,137 @@ def evaluate_auv(
                 else:
                     err_x = err_y = err_heading = float("nan")
 
-                reward = float(traj["reward"])
+                reward = float(traj.get("reward", 0.0))
                 discount = float(traj.get("discount", 1.0))
-                is_last = bool(traj["is_last"])
-                is_terminal = bool(traj["is_terminal"])
+                is_last = bool(traj.get("is_last", False))
+                is_terminal = bool(traj.get("is_terminal", False))
 
-                ep_return += reward
-                final_dist = dist
+                # record distance stats (use raw dist for your original metrics)
                 ep_dists_step.append(dist)
+
+                # overshoot detection
+                is_overshoot_step = detect_first_overshoot(
+                    t=t,
+                    dist_td=dist_td,
+                    dist_dot_td=dist_dot_td,
+                    min_dist_td=min_dist_td,
+                    min_step=min_step,
+                    overshoot_found=overshoot_found,
+                    overshoot_eps=overshoot_eps,
+                    overshoot_min_steps=overshoot_min_steps,
+                    overshoot_require_distdot=overshoot_require_distdot,
+                )
+                if is_overshoot_step and not overshoot_found:
+                    overshoot_found = True
+                    overshoot_step = t
+                    overshoot_payload = dict(
+                        episode=ep,
+                        overshoot_step=t,
+                        min_step=min_step,
+                        min_dist_td=float(min_dist_td),
+                        dist_td=float(dist_td),
+                        dist_dot_td=float(dist_dot_td),
+                        x=float(x), y=float(y), theta=float(theta),
+                        goal_x=float(goal_x), goal_y=float(goal_y),
+                        u=float(u), v=float(v), r=float(r_val),
+                        xe=float(xe), ye=float(ye), dist=float(dist),
+                    )
+
+                # action: at t=0, no action yet (after reset), so write NaN
+                if t == 0:
+                    a0 = a1 = float("nan")
+                else:
+                    # action was produced for this transition in previous loop
+                    # we store it in `last_raw_act`
+                    a0, a1 = last_raw_act  # noqa
 
                 writer.writerow(
                     [
-                        ep, t, reward, discount,
-                        x, y, theta, u, v, r_val,
-                        goal_x, goal_y, xe, ye, dist,
+                        ep, t,
+                        reward, discount,
+                        x, y, theta,
+                        u, v, r_val,
+                        goal_x, goal_y,
+                        xe, ye,
+                        dist,
+                        dist_td, dist_dot_td,
+                        float(min_dist_td),
+                        1 if is_overshoot_step else 0,
                         err_x, err_y, err_heading,
                         phase_cos, phase_sin, t_norm,
-                        float(raw_act[0]), float(raw_act[1]),
+                        a0, a1,
                         is_terminal, is_last,
                     ]
                 )
 
-                # 轨迹跟踪任务：只在 env 标记 is_last 时结束 episode
+                # end episode?
                 if is_last:
+                    ep_return += reward
                     break
 
+                # step env with policy action (except at t=0 we haven't acted yet)
+                action = policy(traj)
+                raw_act = np.asarray(action.get("action", np.zeros(act_shape)), dtype=float).reshape(-1)
+                if raw_act.size == 1:
+                    raw_act = np.array([raw_act.item(), 0.0], dtype=float)
+                else:
+                    raw_act = raw_act[:2]
+                last_raw_act = (float(raw_act[0]), float(raw_act[1]))  # for CSV row at next t
+                traj = env.step(action)
+                ep_return += reward
+
+            # episode summary
             ep_returns.append(ep_return)
             ep_lengths.append(steps)
-            final_dists.append(final_dist)
+            final_dists.append(float(ep_dists_step[-1]) if ep_dists_step else float("nan"))
 
-            ep_dists_arr = np.array(ep_dists_step, dtype=float)
-            mean_dist = float(np.mean(ep_dists_arr))
-            max_dist = float(np.max(ep_dists_arr))
-            track_ratio = float(np.mean(ep_dists_arr <= success_threshold))
+            ep_dists_arr = np.array(ep_dists_step, dtype=float) if ep_dists_step else np.array([np.nan])
+            mean_dist = float(np.nanmean(ep_dists_arr))
+            max_dist = float(np.nanmax(ep_dists_arr))
+            track_ratio = float(np.nanmean(ep_dists_arr <= success_threshold))
 
             mean_dists.append(mean_dist)
             max_dists.append(max_dist)
             track_ratios.append(track_ratio)
 
-            # RMSE（不同自由度）
             if count_err > 0:
                 rmse_x = float(math.sqrt(sum_ex2 / count_err))
                 rmse_y = float(math.sqrt(sum_ey2 / count_err))
                 rmse_heading = float(math.sqrt(sum_hd2 / count_err))
             else:
                 rmse_x = rmse_y = rmse_heading = float("nan")
-
             rmse_x_list.append(rmse_x)
             rmse_y_list.append(rmse_y)
             rmse_heading_list.append(rmse_heading)
 
-            # 定义“成功 episode”：在 success_threshold 内的时间比例 ≥ track_success_ratio
             success_flag = track_ratio >= track_success_ratio
             if success_flag:
                 successes += 1
 
+            # store overshoot record
+            if overshoot_payload is None:
+                overshoot_payload = dict(
+                    episode=ep,
+                    overshoot_step=None,
+                    min_step=int(min_step),
+                    min_dist_td=float(min_dist_td) if min_dist_td != float("inf") else None,
+                    note="no overshoot detected with current thresholds",
+                )
+            overshoot_records.append(overshoot_payload)
+
             if verbose:
                 status = "SUCCESS" if success_flag else "FAIL"
+                os_str = f"overshoot_step={overshoot_step}" if overshoot_step is not None else "overshoot_step=None"
                 print(
                     f"[Episode {ep:03d}] return={ep_return:.2f} steps={steps} "
-                    f"status={status} final_dist={final_dist:.3f} "
+                    f"status={status} final_dist={final_dists[-1]:.3f} "
                     f"mean_dist={mean_dist:.3f} track_ratio={track_ratio:.2f} "
-                    f"rmse_x={rmse_x:.3f} rmse_y={rmse_y:.3f} rmse_heading={rmse_heading:.3f}"
+                    f"rmse_x={rmse_x:.3f} rmse_y={rmse_y:.3f} rmse_heading={rmse_heading:.3f} "
+                    f"{os_str}"
                 )
+
+    # save overshoots.json
+    overshoot_json.write_text(json.dumps(overshoot_records, indent=2, ensure_ascii=False), encoding="utf-8")
 
     metrics = {
         "episodes": episodes,
@@ -518,13 +582,11 @@ def evaluate_auv(
         "avg_ep_len": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "final_dist_mean": float(np.mean(final_dists)) if final_dists else float("nan"),
         "final_dist_std": float(np.std(final_dists)) if final_dists else float("nan"),
-        # 轨迹跟踪相关指标
         "mean_dist_mean": float(np.mean(mean_dists)) if mean_dists else float("nan"),
         "mean_dist_std": float(np.std(mean_dists)) if mean_dists else float("nan"),
         "max_dist_mean": float(np.mean(max_dists)) if max_dists else float("nan"),
         "track_ratio_mean": float(np.mean(track_ratios)) if track_ratios else float("nan"),
         "track_ratio_std": float(np.std(track_ratios)) if track_ratios else float("nan"),
-        # 新增：不同自由度的 RMSE 指标（episode 级别的平均）
         "rmse_x_mean": float(np.mean(rmse_x_list)) if rmse_x_list else float("nan"),
         "rmse_x_std": float(np.std(rmse_x_list)) if rmse_x_list else float("nan"),
         "rmse_y_mean": float(np.mean(rmse_y_list)) if rmse_y_list else float("nan"),
@@ -532,47 +594,40 @@ def evaluate_auv(
         "rmse_heading_mean": float(np.mean(rmse_heading_list)) if rmse_heading_list else float("nan"),
         "rmse_heading_std": float(np.std(rmse_heading_list)) if rmse_heading_list else float("nan"),
         "csv_path": os.path.abspath(out_csv),
+        "overshoot_json": os.path.abspath(overshoot_json),
     }
     return metrics
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a CONTINUOUS-action policy in the AUV environment")
-    parser.add_argument("--ckpt", type=str, default=None, help="DreamerV3 run directory (contains ckpt/)")
-    parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes")
-    parser.add_argument("--dt", type=float, default=0.05, help="Environment integration step")
-    parser.add_argument("--max_steps", type=int, default=800, help="Maximum steps per episode")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for evaluation")
-    parser.add_argument(
-        "--success_threshold",
-        type=float,
-        default=1.0,  # 跟 env 的 success_radius 对齐，用于统计 track_ratio
-        help="Distance (m) regarded as 'good tracking' for ratio/statistics.",
-    )
-    parser.add_argument(
-        "--track_success_ratio",
-        type=float,
-        default=0.7,
-        help="Episode is counted as SUCCESS if fraction of steps with dist <= success_threshold "
-             "is at least this value (e.g. 0.8).",
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="eval_outputs",
-        help="Directory to store evaluation CSV and summary",
-    )
-    parser.add_argument(
-        "--summary_json",
-        type=str,
-        default=None,
-        help="Optional path to save the aggregated metrics as JSON",
-    )
+    parser.add_argument("--ckpt", type=str, default=None, help="DreamerV3 run directory (contains ckpt/) or ckpt step dir")
+    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--dt", type=float, default=0.05)
+    parser.add_argument("--max_steps", type=int, default=800)
+    parser.add_argument("--seed", type=int, default=0)
+
+    parser.add_argument("--success_threshold", type=float, default=1.0)
+    parser.add_argument("--track_success_ratio", type=float, default=0.7)
+
+    parser.add_argument("--out_dir", type=str, default="eval_outputs")
+    parser.add_argument("--summary_json", type=str, default=None)
+
+    # recommended: build env from ckpt config.yaml
+    parser.add_argument("--use_env_from_ckpt", action="store_true", help="Build env via dreamerv3.main.make_env(config) (recommended)")
+    parser.add_argument("--no_use_env_from_ckpt", action="store_false", dest="use_env_from_ckpt")
+    parser.set_defaults(use_env_from_ckpt=True)
+
+    # overshoot params
+    parser.add_argument("--overshoot_eps", type=float, default=0.2)
+    parser.add_argument("--overshoot_min_steps", type=int, default=20)
+    parser.add_argument("--overshoot_require_distdot", action="store_true")
+    parser.add_argument("--no_overshoot_require_distdot", action="store_false", dest="overshoot_require_distdot")
+    parser.set_defaults(overshoot_require_distdot=True)
+
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / "trajectories.csv"
 
     metrics = evaluate_auv(
         args.ckpt,
@@ -581,16 +636,19 @@ def main():
         max_steps=args.max_steps,
         success_threshold=args.success_threshold,
         track_success_ratio=args.track_success_ratio,
-        out_csv=csv_path,
+        out_dir=out_dir,
         seed=args.seed,
         verbose=True,
+        use_env_from_ckpt=args.use_env_from_ckpt,
+        overshoot_eps=args.overshoot_eps,
+        overshoot_min_steps=args.overshoot_min_steps,
+        overshoot_require_distdot=args.overshoot_require_distdot,
     )
 
     if args.summary_json:
-        import json
         summary_path = Path(args.summary_json).expanduser()
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
+        summary_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print("\n=== Evaluation Summary ===")
     for k, v in metrics.items():
