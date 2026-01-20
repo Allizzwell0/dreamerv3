@@ -35,11 +35,11 @@ MAIN_SCRIPT = ROOT / "dreamerv3" / "main.py"
 TASK_NAME = "auv_custom"
 CONFIG_NAME = "auv"
 
-BASE_LOGDIR = Path("/home/mayue/logdir/pbt_conf_auv_2")
+BASE_LOGDIR = Path("/home/mayue/logdir/pbt_conf_auv_3")
 
 POP_SIZE = 5
 GENERATIONS = 6
-STEPS_PER_GEN = int(1e6)
+STEPS_PER_GEN = int(5e6)
 
 HP_BOUNDS: Dict[str, Tuple[float, float]] = {
     "env.auv.base_k_progress": (1.0, 5.0),
@@ -64,22 +64,22 @@ HP_BOUNDS: Dict[str, Tuple[float, float]] = {
 }
 
 BEST_HP: Dict[str, float] = {
-    "env.auv.base_k_progress": 4.995356892068424,
+    "env.auv.base_k_progress": 5.0,
     "env.auv.k_dist": 0.3,
     "env.auv.k_ring": 0.0,
-    "env.auv.bonus_max": 2.094027569655085,
-    "env.auv.hold_bonus": 0.4880082494158719,
-    "env.auv.k_speed_near": 0.41883239676790485,
-    "env.auv.gamma_far": 0.943825316852527,
-    "env.auv.k_heading_base": 0.1569655750036578,
-    "env.auv.td_r": 3.0,
-    "env.auv.td_N": 11.050894970380819,
-    "agent.conf_alpha": 0.2,
-    "agent.conf_min": 0.1,
-    "agent.conf_low_eta_min": 0.05,
+    "env.auv.bonus_max": 1.4103402601424677,
+    "env.auv.hold_bonus": 0.4705573844268462,
+    "env.auv.k_speed_near": 0.1651891484296008,
+    "env.auv.gamma_far": 1.0,
+    "env.auv.k_heading_base": 0.1,
+    "env.auv.td_r": 2.4134922664651395,
+    "env.auv.td_N": 10.895073067624253,
+    "agent.conf_alpha": 0.704133460627363,
+    "agent.conf_min": 0.05933043726498717,
+    "agent.conf_low_eta_min": 0.008749110273372334,
     "agent.conf_low_eta_max": 1.0,
-    "agent.conf_low_eta_gamma": 1.0,
-    "agent.conf_low_tau": 0.5,
+    "agent.conf_low_eta_gamma": 0.8900519329630249,
+    "agent.conf_low_tau": 0.24972999467728338,
     # "agent.conf_k_thrust": 0.3,
     # "agent.conf_k_rudder": 2.0,
 }
@@ -89,7 +89,7 @@ ELITE_FRAC = 0.5
 INIT_MODE = "around_best"  # "around_best" or "random"
 
 # ✅ 断点续跑开关
-RESUME = False
+RESUME = True
 
 # state.json 保存位置
 STATE_PATH = BASE_LOGDIR / "state.json"
@@ -133,6 +133,7 @@ def build_argv(hparams: Dict[str, Any], logdir: Path, seed: int) -> List[str]:
         f"--seed={seed}",
         "--script=train",
         "--env.auv.debug_trace=False",
+        "--env.auv.goal_delay_steps=5",
     ]
 
     # 为了可复现，按 key 排序（可选但推荐）

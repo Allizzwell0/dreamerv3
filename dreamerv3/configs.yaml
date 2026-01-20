@@ -47,6 +47,7 @@ defaults:
       overshoot_eps: 0.2
       overshoot_min_steps: 20
       overshoot_require_distdot: True
+      goal_delay_steps: 5
 
       proprio: True
       image: False
@@ -258,6 +259,7 @@ auv:
       overshoot_eps: 0.2
       overshoot_min_steps: 20
       overshoot_require_distdot: True   # 要求 dist_dot_td>0 才算“回弹”
+      goal_delay_steps: 5
       image: False
       proprio: True
 

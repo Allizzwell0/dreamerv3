@@ -3,21 +3,23 @@
 """
 AUVEnv (Dreamer/embodied.Env)
 
-新增能力（用于定位“过冲发生了什么”）：
-1) 过冲检测（overshoot）：基于 dist_td 相对历史最小值回弹
-2) 诊断信号输出到 obs 的 log/* 字段（不会进入 world model，因为 make_agent 里过滤了 log/ 前缀）
-3) 可选：保存 episode 轨迹到 CSV（包含过冲时刻前后全程信息），方便你画图定位动作/速度/heading_err 等变化
+当前版本：方案1—— cursor + window + lookahead 的“历史轨迹最近点”跟踪
 
-用法（在 configs.yaml 的 env.auv 里加）例如：
-  env:
-    auv:
-      debug_trace: True
-      trace_dir: /home/mayue/logdir/auv_debug_traces
-      overshoot_eps: 0.2
-      overshoot_min_steps: 20
-      save_trace_on_done: True
-      save_trace_on_overshoot: True
-      seed: 0
+核心变化（保持外部接口不变）：
+1) 目标参考点 self.goal：不再取 delay 队列最老点；改为在历史真实目标轨迹中，使用 cursor+window 搜索最近点，
+   再加 lookahead，且窗口会持续向前滑动（带防卡死强制推进）。
+2) 修复隐患：
+   - phase_cos/sin 不再是伪相位：改为“路径切向向量（在艇体坐标系）”两维，仍占用 vector 的第 12/13 维。
+   - progress 不再用 prev_dist - dist_td：改为“沿轨迹推进弧长 delta_s”，稳定且不会被参考点跳变污染。
+   - overshoot 不再用 episode 全局最小：改为“分段最小值（随 cursor 前进重置）”，避免误报。
+   - vector[2] 从 raw dist 改为 dist_td（平滑距离），使观测与 reward 一致更稳定；log/dist 仍保留 raw dist。
+
+外部接口不变：
+- obs_space keys, act_space keys 不变
+- vector shape (15,) 不变
+- log/* 不新增键、不改键名
+- PBT / eval / main 不需要改代码（只需按需新增 env.auv.* 覆盖参数）
+
 """
 
 import os
@@ -25,10 +27,11 @@ import csv
 import math
 import numpy as np
 from pathlib import Path
+from collections import deque
+from itertools import islice
 
 import elements
 import embodied
-from collections import deque
 
 
 # ========== Tracking Differentiator ==========
@@ -160,6 +163,14 @@ def goal_in_body_frame(state_pos, goal):
     return xb, yb, dist
 
 
+def world_vec_to_body(theta, vx, vy):
+    c = math.cos(theta)
+    s = math.sin(theta)
+    bx = c * vx + s * vy
+    by = -s * vx + c * vy
+    return bx, by
+
+
 # ----------------- 连续动作 + 移动目标的 AUV 环境 -----------------
 
 class AUVEnv(embodied.Env):
@@ -181,8 +192,20 @@ class AUVEnv(embodied.Env):
         moving_goal=True,
         goal_center=(10.0, 10.0),
         goal_radius=6.0,
-        goal_speed=0.3,
-        goal_delay_steps = 5,
+        goal_speed=0.3,          # 保留参数（旧 config 兼容），本版本不再用于 phase
+        goal_delay_steps=5,      # 保留：只允许使用“至少 delay 步之前”的轨迹点集合
+
+        # === 轨迹最近点跟随（方案1）参数 ===
+        goal_hist_len=800,               # 历史真实目标轨迹缓存长度
+        nearest_forward_window=200,      # cursor 向前搜索窗口（索引）
+        nearest_backtrack_allow=20,      # 允许回退搜索的窗口（索引）
+        nearest_lookahead=10,            # 参考点前视（索引）
+        nearest_stall_steps=60,          # 连续多少步 cursor 不推进 -> 触发防卡死判断
+        nearest_stall_radius=0.8,        # 若距离参考点 < 该半径且 stall -> 强制推进
+        nearest_force_advance=3,         # 防卡死：一次强制推进多少索引
+
+        # overshoot 分段重置：cursor 推进多少索引后重置 segment min
+        overshoot_reset_idx_delta=20,
 
         # AUV 自身最大速度 / 角速度
         max_auv_speed=5.0,
@@ -244,6 +267,17 @@ class AUVEnv(embodied.Env):
         self.goal_center = tuple(goal_center)
         self.goal_radius = float(goal_radius)
         self.goal_speed = float(goal_speed)
+        self.goal_delay_steps = int(goal_delay_steps)
+
+        # ---- scheme1 params ----
+        self.goal_hist_len = int(goal_hist_len)
+        self.nearest_forward_window = int(nearest_forward_window)
+        self.nearest_backtrack_allow = int(nearest_backtrack_allow)
+        self.nearest_lookahead = int(nearest_lookahead)
+        self.nearest_stall_steps = int(nearest_stall_steps)
+        self.nearest_stall_radius = float(nearest_stall_radius)
+        self.nearest_force_advance = int(nearest_force_advance)
+        self.overshoot_reset_idx_delta = int(overshoot_reset_idx_delta)
 
         self.max_auv_speed = float(max_auv_speed)
         self.max_auv_turn_rate = float(max_auv_turn_rate)
@@ -256,12 +290,6 @@ class AUVEnv(embodied.Env):
         self.goal_ctrl_interval = int(goal_ctrl_interval)
         self.goal_ctrl_smooth = float(goal_ctrl_smooth)
         self.goal_custom_fn = goal_custom_fn
-        self.goal_delay_steps = int(goal_delay_steps)
-        self._goal_hist = deque(maxlen=max(1, self.goal_delay_steps + 1))
-
-        self.goal_live = np.zeros(2, dtype=float)   # 当前真实移动目标（用于生成轨迹）
-        # self.goal 继续保留，但语义改成：给 agent 跟踪的“参考目标”（延迟后的点）
-
 
         self.energy_thrust_coef = float(energy_thrust_coef)
         self.energy_rudder_coef = float(energy_rudder_coef)
@@ -287,7 +315,6 @@ class AUVEnv(embodied.Env):
         # 状态缓存
         self.prev_control = np.zeros(2, dtype=float)
         self.prev_vel = np.zeros(3, dtype=float)
-        self.prev_dist = None
 
         self.steps = 0
         self.done = False
@@ -295,7 +322,8 @@ class AUVEnv(embodied.Env):
         self.state_pos = np.zeros(3, dtype=float)   # [x, y, theta]
         self.state_vel = np.zeros(3, dtype=float)   # [u, v, r]
 
-        self.goal = np.zeros(2, dtype=float)
+        self.goal = np.zeros(2, dtype=float)        # 参考目标（用于追踪）
+        self.goal_live = np.zeros(2, dtype=float)   # 真实目标点（轨迹生成）
         self.goal_pos = np.zeros(3, dtype=float)
         self.goal_vel = np.zeros(3, dtype=float)
         self.goal_control = np.zeros(2, dtype=float)
@@ -303,8 +331,23 @@ class AUVEnv(embodied.Env):
 
         self.time = 0.0
 
-        # 距离 TD
+        # 距离 TD（对 dist 做平滑）
         self.td_dist = TrackingDifferentiator(r=self.td_r, h=self.dt, N=self.td_N)
+
+        # ===== scheme1 trajectory buffers =====
+        self._traj_pts = deque(maxlen=max(8, self.goal_hist_len))
+        self._traj_s = deque(maxlen=max(8, self.goal_hist_len))      # cumulative arc length
+        self._cursor_idx = 0
+        self._prev_cursor_s = 0.0
+        self._stall_count = 0
+
+        # tangent in body frame (stored each step)
+        self._tan_bx = 1.0
+        self._tan_by = 0.0
+
+        # overshoot segment min
+        self._seg_min_dist_td = None
+        self._seg_cursor0 = 0
 
         # ===== overshoot / trace =====
         self.debug_trace = bool(debug_trace)
@@ -318,7 +361,6 @@ class AUVEnv(embodied.Env):
         self._episode_id = 0
         self._trace = []
         self._overshoot = None       # dict or None
-        self._min_dist_td = None     # float
         self._saved_trace = False
 
         if self.debug_trace and self.trace_dir:
@@ -353,7 +395,45 @@ class AUVEnv(embodied.Env):
         self.goal_pos = update_model_state_kine(self.goal_pos, self.goal_vel, self.dt)
         return self.goal_pos[:2].copy()
 
-    # === Dreamer 接口定义 ===
+    # ===== trace helpers =====
+    def _trace_append(self, row: dict):
+        if not self.debug_trace:
+            return
+        self._trace.append(row)
+
+    def _save_trace(self, reason: str):
+        if (not self.debug_trace) or self._saved_trace:
+            return
+        if not self.trace_dir:
+            return
+        try:
+            outdir = Path(self.trace_dir)
+            outdir.mkdir(parents=True, exist_ok=True)
+            base = f"ep{self._episode_id:06d}_{reason}"
+            csv_path = outdir / f"{base}.csv"
+            meta_path = outdir / f"{base}.meta.txt"
+
+            if self._trace:
+                keys = list(self._trace[0].keys())
+                with open(csv_path, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=keys)
+                    w.writeheader()
+                    for r in self._trace:
+                        w.writerow(r)
+
+            with open(meta_path, "w") as f:
+                f.write(f"episode_id: {self._episode_id}\n")
+                f.write(f"reason: {reason}\n")
+                f.write(f"seed: {self.seed}\n")
+                f.write(f"overshoot_eps: {self.overshoot_eps}\n")
+                f.write(f"overshoot_min_steps: {self.overshoot_min_steps}\n")
+                f.write(f"overshoot: {self._overshoot}\n")
+
+            self._saved_trace = True
+        except Exception as e:
+            print(f"[AUVEnv] WARNING: failed to save trace: {e}")
+
+    # ===== Dreamer 接口定义 =====
     @property
     def obs_space(self):
         scalar_f = elements.Space(np.float32, ())
@@ -364,7 +444,6 @@ class AUVEnv(embodied.Env):
             "is_last": elements.Space(bool, ()),
             "is_terminal": elements.Space(bool, ()),
 
-            # ---- per-step diagnostics (won't be used by world model) ----
             "log/dist": scalar_f,
             "log/dist_td": scalar_f,
             "log/dist_dot_td": scalar_f,
@@ -388,7 +467,6 @@ class AUVEnv(embodied.Env):
             "log/speed_cost_near": scalar_f,
             "log/ring_cost": scalar_f,
 
-            # ---- overshoot detector output ----
             "log/overshoot": scalar_f,
             "log/overshoot_x": scalar_f,
             "log/overshoot_y": scalar_f,
@@ -404,7 +482,6 @@ class AUVEnv(embodied.Env):
         }
 
     def close(self):
-        # optional hook
         pass
 
     def _parse_action(self, action):
@@ -418,46 +495,153 @@ class AUVEnv(embodied.Env):
         deltar = float(self.rudder_max * a[1])
         return Xprop, deltar
 
-    # ===== trace helpers =====
+    # ===== scheme1 internals =====
+    def _traj_append(self, pt_xy: np.ndarray):
+        """
+        Append a new real goal point to trajectory buffer, maintaining cumulative arc length.
+        Handles deque maxlen eviction and keeps cursor indices consistent.
+        """
+        pt_xy = np.asarray(pt_xy, dtype=float).reshape(2,)
 
-    def _trace_append(self, row: dict):
-        if not self.debug_trace:
-            return
-        self._trace.append(row)
+        # If deque is full, the leftmost element will be evicted on append.
+        # Pre-adjust cursor/segment anchors to remain aligned to new indexing.
+        if len(self._traj_pts) == self._traj_pts.maxlen:
+            self._cursor_idx = max(0, self._cursor_idx - 1)
+            self._seg_cursor0 = max(0, self._seg_cursor0 - 1)
 
-    def _save_trace(self, reason: str):
-        if (not self.debug_trace) or self._saved_trace:
-            return
-        if not self.trace_dir:
-            return
-        try:
-            outdir = Path(self.trace_dir)
-            outdir.mkdir(parents=True, exist_ok=True)
-            base = f"ep{self._episode_id:06d}_{reason}"
-            csv_path = outdir / f"{base}.csv"
-            meta_path = outdir / f"{base}.meta.txt"
+        if len(self._traj_pts) == 0:
+            s_new = 0.0
+        else:
+            last = self._traj_pts[-1]
+            ds = float(np.linalg.norm(pt_xy - last))
+            s_new = float(self._traj_s[-1] + ds)
 
-            # CSV
-            if self._trace:
-                keys = list(self._trace[0].keys())
-                with open(csv_path, "w", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=keys)
-                    w.writeheader()
-                    for r in self._trace:
-                        w.writerow(r)
+        self._traj_pts.append(pt_xy.copy())
+        self._traj_s.append(s_new)
 
-            # meta
-            with open(meta_path, "w") as f:
-                f.write(f"episode_id: {self._episode_id}\n")
-                f.write(f"reason: {reason}\n")
-                f.write(f"seed: {self.seed}\n")
-                f.write(f"overshoot_eps: {self.overshoot_eps}\n")
-                f.write(f"overshoot_min_steps: {self.overshoot_min_steps}\n")
-                f.write(f"overshoot: {self._overshoot}\n")
+    def _select_goal_by_path(self):
+        """
+        Scheme1: cursor + window + lookahead.
+        Uses only points up to avail_last = len(traj)-1-goal_delay_steps (i.e., already produced trajectory).
+        Updates:
+          - self.goal (reference goal point)
+          - self._tan_bx, self._tan_by (path tangent in body frame)
+          - self._cursor_idx, self._stall_count
+        Returns:
+          ref_dist (float): distance from AUV to reference goal (raw dist)
+          forced_advance (bool): whether anti-stall forced advance happened
+          cursor_s (float): cumulative arc length at cursor
+        """
+        forced_advance = False
 
-            self._saved_trace = True
-        except Exception as e:
-            print(f"[AUVEnv] WARNING: failed to save trace: {e}")
+        L = len(self._traj_pts)
+        if L == 0:
+            self.goal = self.goal_live.copy()
+            self._tan_bx, self._tan_by = 1.0, 0.0
+            return 0.0, forced_advance, 0.0
+
+        # only allow using points that are at least delay_steps old
+        avail_last = L - 1 - max(0, self.goal_delay_steps)
+        if avail_last < 0:
+            avail_last = 0
+
+        # clamp cursor within available range
+        self._cursor_idx = int(np.clip(self._cursor_idx, 0, avail_last))
+
+        # window end needs to include lookahead + possible force advance margin
+        margin = max(self.nearest_lookahead, self.nearest_force_advance, 0) + 2
+        start = max(0, self._cursor_idx - max(0, self.nearest_backtrack_allow))
+        end = min(avail_last, self._cursor_idx + max(0, self.nearest_forward_window) + margin)
+        if end < start:
+            start = end
+
+        # collect candidate points (window)
+        cand_pts = list(islice(self._traj_pts, start, end + 1))
+        cand_s = list(islice(self._traj_s, start, end + 1))
+        if len(cand_pts) == 0:
+            self.goal = self._traj_pts[avail_last].copy()
+            self._tan_bx, self._tan_by = 1.0, 0.0
+            return 0.0, forced_advance, float(self._traj_s[self._cursor_idx])
+
+        pts = np.asarray(cand_pts, dtype=float)  # [K,2]
+
+        x, y = float(self.state_pos[0]), float(self.state_pos[1])
+        dx = pts[:, 0] - x
+        dy = pts[:, 1] - y
+        d2 = dx * dx + dy * dy
+        best_local = int(np.argmin(d2))
+        best_idx = start + best_local
+
+        # basic stall detection (cursor not advancing)
+        if best_idx <= self._cursor_idx:
+            self._stall_count += 1
+        else:
+            self._stall_count = 0
+
+        # advance cursor (monotonic)
+        cursor_next = max(self._cursor_idx, best_idx)
+
+        # anti-stall: if stuck and already close to reference, force advance
+        dist_to_best = float(math.sqrt(float(d2[best_local])))
+        if (self._stall_count >= self.nearest_stall_steps) and (dist_to_best < self.nearest_stall_radius):
+            cursor_next = min(avail_last, cursor_next + max(1, self.nearest_force_advance))
+            forced_advance = True
+            self._stall_count = 0
+
+        self._cursor_idx = int(np.clip(cursor_next, 0, avail_last))
+
+        # reference index: use cursor-based lookahead (more stable than best-based)
+        ref_idx = min(avail_last, self._cursor_idx + max(0, self.nearest_lookahead))
+
+        # ref_idx must be within [start,end] candidate list for tangent computation.
+        # If not, build a small local list around ref_idx (rare when cursor jumps a lot).
+        if not (start <= ref_idx <= end):
+            # rebuild around new cursor
+            start = max(0, self._cursor_idx - max(0, self.nearest_backtrack_allow))
+            end = min(avail_last, self._cursor_idx + max(0, self.nearest_forward_window) + margin)
+            cand_pts = list(islice(self._traj_pts, start, end + 1))
+            cand_s = list(islice(self._traj_s, start, end + 1))
+            pts = np.asarray(cand_pts, dtype=float)
+
+        local_ref = int(ref_idx - start)
+        local_ref = int(np.clip(local_ref, 0, len(cand_pts) - 1))
+
+        self.goal = np.asarray(cand_pts[local_ref], dtype=float).copy()
+
+        # tangent: use neighbor within available range
+        if (local_ref + 1) < len(cand_pts):
+            p0 = np.asarray(cand_pts[local_ref], dtype=float)
+            p1 = np.asarray(cand_pts[local_ref + 1], dtype=float)
+        elif local_ref > 0:
+            p0 = np.asarray(cand_pts[local_ref - 1], dtype=float)
+            p1 = np.asarray(cand_pts[local_ref], dtype=float)
+        else:
+            p0 = np.asarray(cand_pts[local_ref], dtype=float)
+            p1 = p0 + np.array([1.0, 0.0], dtype=float)
+
+        tw = p1 - p0
+        n = float(np.linalg.norm(tw))
+        if n < 1e-6:
+            tw = np.array([1.0, 0.0], dtype=float)
+            n = 1.0
+        tw = tw / n
+
+        # tangent in BODY frame -> replace phase_cos/sin (two dims) with meaningful feature
+        theta = float(self.state_pos[2])
+        tbx, tby = world_vec_to_body(theta, float(tw[0]), float(tw[1]))
+        self._tan_bx, self._tan_by = float(tbx), float(tby)
+
+        # cursor arc length (for progress reward)
+        local_cursor = int(self._cursor_idx - start)
+        if 0 <= local_cursor < len(cand_s):
+            cursor_s = float(cand_s[local_cursor])
+        else:
+            # fallback (rare)
+            cursor_s = float(list(islice(self._traj_s, self._cursor_idx, self._cursor_idx + 1))[0])
+
+        # distance to reference goal (raw)
+        ref_dist = float(math.hypot(float(self.goal[0] - x), float(self.goal[1] - y)))
+        return ref_dist, forced_advance, cursor_s
 
     # === step ===
     def step(self, action):
@@ -470,47 +654,46 @@ class AUVEnv(embodied.Env):
         if self.moving_goal:
             self.goal_live = self._goal_traj(self.time)
         else:
-            # 静态目标：goal_live 就等于当前 goal
+            # 静态目标：保持不变
             self.goal_live = self.goal.copy()
 
-        # 写入历史并取 delay 步之前的参考点
-        self._goal_hist.append(self.goal_live.copy())
-        self.goal = self._goal_hist[0].copy()   # 这一步之后，reward/obs 用的都是“延迟目标”
-
+        # --------- 写入真实目标轨迹 ----------
+        self._traj_append(self.goal_live)
 
         # --------- AUV 动力学推进 ----------
         Xprop, deltar = self._parse_action(action)
         control = np.array([Xprop, deltar], dtype=float)
 
         self.state_vel = update_model_state_dyn(self.state_vel, control, self.dt)
-
         self.state_vel[0] = np.clip(self.state_vel[0], -self.max_auv_speed, self.max_auv_speed)
         self.state_vel[1] = np.clip(self.state_vel[1], -self.max_auv_speed, self.max_auv_speed)
         self.state_vel[2] = np.clip(self.state_vel[2], -self.max_auv_turn_rate, self.max_auv_turn_rate)
 
         self.state_pos = update_model_state_kine(self.state_pos, self.state_vel, self.dt)
 
-        # === 误差：在船体坐标系下表示目标位置 ===
+        # --------- scheme1: 从历史轨迹中选 reference goal ----------
+        _ref_dist_raw, forced_advance, cursor_s = self._select_goal_by_path()
+
+        # === 误差：在船体坐标系下表示参考目标位置 ===
         xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
-        # TD 平滑距离
+        # TD 平滑距离（用于 reward 与 obs 的 dist 维度）
         dist_td, dist_dot_td = self.td_dist.step(dist)
 
-        time_ref = max(0.0, self.time - self.goal_delay_steps * self.dt)
-        phase = self.goal_speed * time_ref
-        phase_cos = math.cos(phase)
-        phase_sin = math.sin(phase)
+        # ---- progress: 沿轨迹推进弧长 delta_s（稳定）----
+        delta_s = float(cursor_s - self._prev_cursor_s)
+        self._prev_cursor_s = float(cursor_s)
+
+        # “phase”两维不再是伪相位：改用 path tangent in body frame
+        phase_cos = float(self._tan_bx)
+        phase_sin = float(self._tan_by)
 
         t_norm = self.time / (self.max_steps * self.dt + 1e-6)
 
         # ========== Reward 计算开始 ==========
         eps = 1e-6
 
-        if self.prev_dist is None:
-            self.prev_dist = dist_td
-        progress = self.prev_dist - dist_td
-        self.prev_dist = dist_td
-
+        # 用 dist_td 做归一化尺度（与旧版一致的量纲）
         base_k_progress = self.base_k_progress
 
         radius_ref_far = max(2.0 * self.goal_radius, 1e-6)
@@ -533,10 +716,11 @@ class AUVEnv(embodied.Env):
         k_dist = self.k_dist
         r_dist = -k_dist * dist_norm_near
 
+        # progress reward: delta_s (arc length along path)
         dist_norm_clip = np.clip(dist_norm_near, 0.0, 1.0)
         k_progress = base_k_progress * (1.3 - 0.3 * dist_norm_clip)
-        s = 0.03
-        r_progress = k_progress * math.tanh(progress / s) * s
+        s0 = 0.03  # 与旧版一致的 shaping scale；对 delta_s 通常仍有效
+        r_progress = k_progress * math.tanh(delta_s / (s0 + 1e-12)) * s0
 
         norm_thrust = Xprop / (self.thrust_scale + eps)
         norm_rudder = deltar / (self.rudder_max + eps)
@@ -603,14 +787,19 @@ class AUVEnv(embodied.Env):
         reward = float(np.clip(reward, -10.0, 10.0))
         # ========== Reward 计算结束 ==========
 
-        # ===== overshoot detector =====
-        if self._min_dist_td is None:
-            self._min_dist_td = float(dist_td)
+        # ===== overshoot detector（分段 min，随 cursor 前进重置）=====
+        if self._seg_min_dist_td is None:
+            self._seg_min_dist_td = float(dist_td)
+            self._seg_cursor0 = int(self._cursor_idx)
+
+        if forced_advance or ((int(self._cursor_idx) - int(self._seg_cursor0)) >= self.overshoot_reset_idx_delta):
+            self._seg_cursor0 = int(self._cursor_idx)
+            self._seg_min_dist_td = float(dist_td)
         else:
-            self._min_dist_td = min(self._min_dist_td, float(dist_td))
+            self._seg_min_dist_td = min(float(self._seg_min_dist_td), float(dist_td))
 
         if (self._overshoot is None) and (self.steps >= self.overshoot_min_steps):
-            cond = (dist_td > self._min_dist_td + self.overshoot_eps)
+            cond = (dist_td > float(self._seg_min_dist_td) + self.overshoot_eps)
             if self.overshoot_require_distdot:
                 cond = cond and (dist_dot_td > 0.0)
             if cond:
@@ -651,7 +840,7 @@ class AUVEnv(embodied.Env):
             "dist": float(dist),
             "dist_td": float(dist_td),
             "dist_dot_td": float(dist_dot_td),
-            "min_dist_td": float(self._min_dist_td if self._min_dist_td is not None else np.nan),
+            "min_dist_td": float(self._seg_min_dist_td if self._seg_min_dist_td is not None else np.nan),
             "heading_err": float(heading_err),
             "Xprop": float(Xprop),
             "deltar": float(deltar),
@@ -667,6 +856,10 @@ class AUVEnv(embodied.Env):
             "ring_cost": float(ring_cost),
             "reward": float(reward),
             "overshoot": float(1.0 if self._overshoot is not None else 0.0),
+            "delta_s": float(delta_s),
+            "cursor_idx": int(self._cursor_idx),
+            "tan_bx": float(self._tan_bx),
+            "tan_by": float(self._tan_by),
         })
 
         # 结束条件
@@ -681,9 +874,13 @@ class AUVEnv(embodied.Env):
         self.prev_control = control.copy()
         self.prev_vel = self.state_vel.copy()
 
+        # ===== vector(15)（接口不变，语义更一致）=====
+        # 维度定义保持不变：
+        # [xb, yb, dist*, cos(theta), sin(theta), u, v, r, x, y, gx, gy, phase_cos, phase_sin, t_norm]
+        # 其中 dist* 改为 dist_td（平滑距离），phase_cos/sin 改为切向量(body)
         obs = np.array(
             [
-                xb, yb, dist,
+                xb, yb, float(dist_td),
                 math.cos(self.state_pos[2]),
                 math.sin(self.state_pos[2]),
                 self.state_vel[0],
@@ -719,7 +916,7 @@ class AUVEnv(embodied.Env):
                 "log/dist": np.float32(dist),
                 "log/dist_td": np.float32(dist_td),
                 "log/dist_dot_td": np.float32(dist_dot_td),
-                "log/min_dist_td": np.float32(self._min_dist_td if self._min_dist_td is not None else np.nan),
+                "log/min_dist_td": np.float32(self._seg_min_dist_td if self._seg_min_dist_td is not None else np.nan),
                 "log/heading_err": np.float32(heading_err),
 
                 "log/Xprop": np.float32(Xprop),
@@ -748,7 +945,6 @@ class AUVEnv(embodied.Env):
         )
 
     def _reset(self):
-        # 如果上一局 trace 还没保存（比如你关了 done 保存但想保留），这里可按需保存
         self.steps = 0
         self.done = False
         self.time = 0.0
@@ -766,7 +962,6 @@ class AUVEnv(embodied.Env):
 
         self.prev_control = np.zeros(2, dtype=float)
         self.prev_vel = self.state_vel.copy()
-        self.prev_dist = None
 
         # 目标初始位置
         if self.moving_goal:
@@ -779,45 +974,53 @@ class AUVEnv(embodied.Env):
                 dtype=float,
             )
             self.goal_vel = np.zeros(3, dtype=float)
-            self.goal = self.goal_pos[:2].copy()
+            self.goal_live = self.goal_pos[:2].copy()
             self.goal_control = np.zeros(2, dtype=float)
             self.goal_ctrl_step = 0
         else:
-            self.goal = np.array(
+            self.goal_live = np.array(
                 [
                     self.np_random.uniform(8.0, 12.0),
                     self.np_random.uniform(8.0, 12.0),
                 ],
                 dtype=float,
             )
-            self.goal_pos = np.array([self.goal[0], self.goal[1], 0.0], dtype=float)
+            self.goal_pos = np.array([self.goal_live[0], self.goal_live[1], 0.0], dtype=float)
             self.goal_vel = np.zeros(3, dtype=float)
             self.goal_control = np.zeros(2, dtype=float)
             self.goal_ctrl_step = 0
-        # --- init goal history for delayed tracking ---
-        self.goal_live = self.goal.copy()
-        self._goal_hist.clear()
-        for _ in range(self._goal_hist.maxlen):
-            self._goal_hist.append(self.goal_live.copy())
 
-        # 参考目标：队列最老的那个 = delay 步之前
-        self.goal = self._goal_hist[0].copy()
+        # ---- init trajectory buffers ----
+        self._traj_pts.clear()
+        self._traj_s.clear()
+        self._cursor_idx = 0
+        self._stall_count = 0
+        self._tan_bx, self._tan_by = 1.0, 0.0
 
+        # prefill some points so delay gating has something to use
+        prefill = max(1, self.goal_delay_steps + 1)
+        for _ in range(prefill):
+            self._traj_append(self.goal_live)
+
+        # select initial reference goal + tangent
+        _ref_dist_raw, _forced, cursor_s = self._select_goal_by_path()
+        self._prev_cursor_s = float(cursor_s)
 
         xb, yb, dist = goal_in_body_frame(self.state_pos, self.goal)
 
         # TD 初始化
         self.td_dist.reset(dist)
-        self.prev_dist = float(dist)
+        dist_td = float(dist)
 
-        # ===== init overshoot/trace =====
+        # overshoot segment init
         self._episode_id += 1
         self._trace = []
         self._overshoot = None
-        self._min_dist_td = float(dist)
         self._saved_trace = False
+        self._seg_min_dist_td = float(dist_td)
+        self._seg_cursor0 = int(self._cursor_idx)
 
-        # 初始帧也记一条
+        # 初始帧 trace
         self._trace_append({
             "t": float(self.time),
             "step": int(self.steps),
@@ -832,9 +1035,9 @@ class AUVEnv(embodied.Env):
             "xb": float(xb),
             "yb": float(yb),
             "dist": float(dist),
-            "dist_td": float(dist),
+            "dist_td": float(dist_td),
             "dist_dot_td": 0.0,
-            "min_dist_td": float(dist),
+            "min_dist_td": float(self._seg_min_dist_td),
             "heading_err": float(math.atan2(yb, xb)),
             "Xprop": 0.0,
             "deltar": 0.0,
@@ -850,16 +1053,20 @@ class AUVEnv(embodied.Env):
             "ring_cost": 0.0,
             "reward": 0.0,
             "overshoot": 0.0,
+            "delta_s": 0.0,
+            "cursor_idx": int(self._cursor_idx),
+            "tan_bx": float(self._tan_bx),
+            "tan_by": float(self._tan_by),
         })
 
-        phase = self.goal_speed * self.time
-        phase_cos = math.cos(phase)
-        phase_sin = math.sin(phase)
+        # vector(15)：dist 用 dist_td；phase_cos/sin 用 tangent(body)
+        phase_cos = float(self._tan_bx)
+        phase_sin = float(self._tan_by)
         t_norm = 0.0
 
         obs = np.array(
             [
-                xb, yb, dist,
+                xb, yb, float(dist_td),
                 math.cos(self.state_pos[2]),
                 math.sin(self.state_pos[2]),
                 self.state_vel[0],
@@ -876,7 +1083,6 @@ class AUVEnv(embodied.Env):
             dtype=np.float32,
         )
 
-        # reset 时 log/* 也必须返回（否则 CheckSpaces 会报缺字段）
         return dict(
             vector=obs,
             reward=np.float32(0.0),
@@ -886,9 +1092,9 @@ class AUVEnv(embodied.Env):
 
             **{
                 "log/dist": np.float32(dist),
-                "log/dist_td": np.float32(dist),
+                "log/dist_td": np.float32(dist_td),
                 "log/dist_dot_td": np.float32(0.0),
-                "log/min_dist_td": np.float32(dist),
+                "log/min_dist_td": np.float32(self._seg_min_dist_td),
                 "log/heading_err": np.float32(math.atan2(yb, xb)),
 
                 "log/Xprop": np.float32(0.0),
