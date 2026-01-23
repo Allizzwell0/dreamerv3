@@ -144,14 +144,15 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
-     ===== confidence gating (policy-time) =====
+    #  ===== confidence gating (policy-time) =====
     conf_enable: true
-    conf_alpha: 0.34284611654502795
-    conf_min: 0.011655542514402845
-    conf_low_eta_min: 0.11434785526842392
-    conf_low_eta_max: 1.00
-    conf_low_eta_gamma: 1.3091640967023248
-    conf_low_tau: 0.4901353988897491
+    conf_alpha: 0.2
+    conf_min: 0.0
+    conf_low_eta_min: 0.0
+    conf_low_eta_max: 0.8645512263507567
+    conf_low_eta_gamma: 1.2117864684004653
+    conf_low_tau: 0.4615729953193636
+    conf_pos_scale: 10.0
 
 
 size1m: &size1m
@@ -264,16 +265,16 @@ auv:
       proprio: True
 
       # ===== PBT round3 best hyperparameters =====
-      base_k_progress: 5.0
-      k_dist: 0.6897387931279519
+      base_k_progress: 2.9187559964161807
+      k_dist: 0.9985711067590795
       k_ring: 0.0
-      bonus_max: 2.4626454450201236
-      hold_bonus: 0.7043220508831907
-      k_speed_near: 0.43693174000367474
-      gamma_far: 1.0
-      k_heading_base: 0.260379918441288
-      td_r: 3.0
-      td_N: 12.0
+      bonus_max: 0.9671051841185614
+      hold_bonus: 0.0
+      k_speed_near: 0.2867951753498698
+      gamma_far: 0.6517146785729967
+      k_heading_base: 0.29351826486052646
+      td_r: 2.2278618498225966
+      td_N: 10.4551916995632
 
   run:
     envs: 16

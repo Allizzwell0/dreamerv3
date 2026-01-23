@@ -212,8 +212,8 @@ class AUVEnv(embodied.Env):
         max_auv_turn_rate=3.0,
 
         # 目标最大速度 / 角速度
-        max_goal_speed=0.5,
-        max_goal_turn_rate=0.3,
+        max_goal_speed=2.0,
+        max_goal_turn_rate=1.2,
 
         # 目标控制尺度和更新策略
         goal_thrust_scale=20.0,

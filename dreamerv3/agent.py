@@ -153,11 +153,21 @@ class Agent(embodied.jax.Agent):
       if true_vec.ndim == pred_vec.ndim + 1:
         true_vec = true_vec[:, 0]
 
-      err = pred_vec - true_vec
-      mse = jnp.mean(err ** 2, axis=-1, keepdims=True)  # (B,1)
+      # local dims（排除 x,y,gx,gy）
+      pos_idx  = [0,1,2]                  # xb,yb,dist_td
+      rest_idx = [3,4,5,6,7,12,13,14]     # cos,sin,u,v,r,phase_cos,phase_sin,t_norm
 
+      pos_scale = f32(getattr(conf_cfg, 'conf_pos_scale', 10.0))
+      pos_scale = jnp.maximum(pos_scale, 1e-6)
+
+      err_pos  = (pred_vec[..., pos_idx]  - true_vec[..., pos_idx])  / pos_scale
+      err_rest = (pred_vec[..., rest_idx] - true_vec[..., rest_idx])
+
+      err_local = jnp.concatenate([err_pos, err_rest], axis=-1)
+      mse = jnp.mean(err_local ** 2, axis=-1, keepdims=True)  # (B,1)
       conf = jnp.exp(-alpha * mse)
-      conf = jnp.clip(conf, conf_min, 1.0)  # (B,1)
+      conf = jnp.clip(conf, conf_min, 1.0)
+
 
       # ======== prev-action blending (no safe policy) ========
       # prevact 是上一步 sample(policy) 的返回 dict，你在 carry 里保存了它
@@ -180,8 +190,6 @@ class Agent(embodied.jax.Agent):
       act['action'] = jnp.clip(act['action'], -1.0, 1.0)
 
 
-
-      # ✅ 强烈建议：训练时不要往 out 里加新 key（否则可能进 replay 触发 spaces assert）
       # 如果你只想在 eval 看，就只在 mode=='eval' 时输出，且最好用 log/ 前缀
       if mode == 'eval':
         out['log/wm_conf'] = conf.squeeze(-1)
@@ -249,42 +257,64 @@ class Agent(embodied.jax.Agent):
       losses[key] = recon.loss(sg(target))
       # ====== 新增：world model 预测质量指标 ======
       if key == 'vector':
-        # 1) 解码器的预测（形状大概是 [B, T, D]）
-        #   如果你的 Head 接口不是 .pred()，可以改成 recon.mode() / recon.dist.mean() 等
+        # pred/target/err 这些你已经有
         pred = recon.pred()
-
-        # 2) 计算每个时间步的 MSE：(B, T)
         err = pred - target
-        mse_bt = jnp.mean(err ** 2, axis=-1)   # 对 feature 维度求平均
 
-        # 3) 计算 batch 标量：整体 MSE / RMSE
-        wm_mse = jnp.mean(mse_bt)              # 标量
-        wm_rmse = jnp.sqrt(wm_mse + 1e-8)
+        # ---------- 全维（保留原来的） ----------
+        mse_bt_full = jnp.mean(err ** 2, axis=-1)   # (B,T)
+        wm_mse_full = jnp.mean(mse_bt_full)
+        wm_rmse_full = jnp.sqrt(wm_mse_full + 1e-8)
 
-        # 4) 也可以给一个“阈值准确率”：多少维误差 < eps
-        eps = 0.3  # 你可以自己调，比如 0.1、0.5 等
-        hit = (jnp.abs(err) < eps).astype(jnp.float32)
-        # 每个时间步的 feature 命中率 → 再对 B,T 平均
-        acc = jnp.mean(hit)
+        eps = 0.3
+        acc_full = jnp.mean((jnp.abs(err) < eps).astype(jnp.float32))
 
-        # 5) 写入 metrics（注意这里是 world model 的指标，不是 loss）
-        metrics['wm_mse_vec'] = wm_mse
-        metrics['wm_rmse_vec'] = wm_rmse
-        metrics['wm_acc_vec'] = acc
+        metrics['wm_mse_vec'] = wm_mse_full
+        metrics['wm_rmse_vec'] = wm_rmse_full
+        metrics['wm_acc_vec'] = acc_full
 
-        # ====== NEW: 训练期 confidence 指标（不会进 replay）======
+        # ---------- 局部相对量（排除 x,y,gx,gy = idx 8..11） ----------
+        local_idx = [0,1,2,3,4,5,6,7,12,13,14]
+        idx = jnp.array(local_idx, dtype=jnp.int32)
+
+        pred_local = jnp.take(pred, idx, axis=-1)
+        tgt_local  = jnp.take(target, idx, axis=-1)
+        err_local  = pred_local - tgt_local
+
+        mse_bt_local = jnp.mean(err_local ** 2, axis=-1)  # (B,T)
+        wm_mse_local = jnp.mean(mse_bt_local)
+        wm_rmse_local = jnp.sqrt(wm_mse_local + 1e-8)
+        acc_local = jnp.mean((jnp.abs(err_local) < eps).astype(jnp.float32))
+
+        metrics['wm_mse_local'] = wm_mse_local
+        metrics['wm_rmse_local'] = wm_rmse_local
+        metrics['wm_acc_local'] = acc_local
+
+        # ---------- 建议再加：分组 MSE（更容易定位是谁把 mse 拉爆） ----------
+        def mean_bt(x):  # x: (B,T,dim)
+          return jnp.mean(jnp.mean(x, axis=-1))  # -> scalar
+
+        metrics['wm_mse_local_pos']    = mean_bt(err[..., [0,1,2]] ** 2)    # xb,yb,dist_td
+        metrics['wm_mse_local_heading']= mean_bt(err[..., [3,4]] ** 2)      # cos,sin
+        metrics['wm_mse_local_vel']    = mean_bt(err[..., [5,6,7]] ** 2)    # u,v,r
+        metrics['wm_mse_local_phase']  = mean_bt(err[..., [12,13]] ** 2)    # phase_cos,sin
+        metrics['wm_mse_local_tnorm']  = mean_bt(err[..., [14]] ** 2)       # t_norm
+
+        # ---------- conf 统计：改成基于 local（推荐与你 gating 一致） ----------
         conf_cfg = getattr(self.config, 'agent', self.config)
         alpha = f32(getattr(conf_cfg, 'conf_alpha', 2.0))
         conf_min = f32(getattr(conf_cfg, 'conf_min', 0.05))
 
-        # mse_bt: (B,T)
-        conf_bt = jnp.exp(-alpha * mse_bt)
-        conf_bt = jnp.clip(conf_bt, conf_min, 1.0)
+        conf_raw_bt = jnp.exp(-alpha * mse_bt_local)        # (B,T)
+        conf_bt = jnp.clip(conf_raw_bt, conf_min, 1.0)
 
         metrics['wm_conf_mean'] = jnp.mean(conf_bt)
         metrics['wm_conf_p10']  = jnp.quantile(conf_bt, 0.10)
+        metrics['wm_conf_p50']  = jnp.quantile(conf_bt, 0.50)
+        metrics['wm_conf_p90']  = jnp.quantile(conf_bt, 0.90)
 
-# ====== NEW end ======
+        metrics['wm_conf_clip_frac'] = jnp.mean((conf_raw_bt < conf_min).astype(jnp.float32))
+
 
       # ====== 新增部分结束 ======
 
