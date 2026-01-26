@@ -35,7 +35,7 @@ MAIN_SCRIPT = ROOT / "dreamerv3" / "main.py"
 TASK_NAME = "auv_custom"
 CONFIG_NAME = "auv"
 
-BASE_LOGDIR = Path("/home/mayue/logdir/pbt_conf_auv_3")
+BASE_LOGDIR = Path("/home/mayue/logdir/pbt_conf_auv_4")
 
 POP_SIZE = 5
 GENERATIONS = 6
@@ -209,16 +209,21 @@ def evaluate_logdir(logdir: Path, eval_seed: int, episodes: int = 10) -> float:
 
     success_rate = float(metrics.get("success_rate", 0.0))
     mean_dist = float(metrics.get("mean_dist_mean", 1e9))
+    mean_dist_std = float(metrics.get("mean_dist_std", 1e9))
     track_ratio_mean = float(metrics.get("track_ratio_mean", 0.0))
+    track_ratio_std = float(metrics.get("track_ratio_std", 1e9))
     max_dist_mean = float(metrics.get("max_dist_mean", 1e9))
 
-    fitness = success_rate * 10.0 + track_ratio_mean - mean_dist - 0.5 * max_dist_mean
+    fitness = 10.0 * success_rate + track_ratio_mean - mean_dist - 0.5 * mean_dist_std - 0.2 * track_ratio_std
+
 
     save_json(fitness_path, {
         "fitness": fitness,
         "success_rate": success_rate,
         "mean_dist_mean": mean_dist,
+        "mean_dist_std": mean_dist_std,
         "track_ratio_mean": track_ratio_mean,
+        "track_ratio_std": track_ratio_std,
         "max_dist_mean": max_dist_mean,
         "metrics": metrics,
     })

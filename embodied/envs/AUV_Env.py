@@ -218,8 +218,8 @@ class AUVEnv(embodied.Env):
         # 目标控制尺度和更新策略
         goal_thrust_scale=20.0,
         goal_rudder_max=0.3,
-        goal_ctrl_interval=10,
-        goal_ctrl_smooth=0.8,
+        goal_ctrl_interval=5,
+        goal_ctrl_smooth=0.6,
 
         goal_custom_fn=None,
 

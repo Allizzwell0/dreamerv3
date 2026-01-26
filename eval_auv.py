@@ -607,8 +607,8 @@ def main():
     parser.add_argument("--max_steps", type=int, default=800)
     parser.add_argument("--seed", type=int, default=0)
 
-    parser.add_argument("--success_threshold", type=float, default=1.0)
-    parser.add_argument("--track_success_ratio", type=float, default=0.7)
+    parser.add_argument("--success_threshold", type=float, default=0.5)
+    parser.add_argument("--track_success_ratio", type=float, default=0.8)
 
     parser.add_argument("--out_dir", type=str, default="eval_outputs")
     parser.add_argument("--summary_json", type=str, default=None)
