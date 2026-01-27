@@ -45,19 +45,6 @@ python -m scope.viewer --basedir ~/logdir/auv --port 8000
 python pbt_auv.py
 ```
 
-# 用于Chemistry
-api
-
-```bash
-export NEWAPI_API_KEY="sk-eZiZsS9eylMzAfLHmfhVufNsjXAJzFxlfIi1bzQzKFYTqygx"
-```
-
-训练
-
-```bash
-python3 main.py ~/WorldModel/Dreamer/papers/test/ --workers 32 --retries 3 --save-images 
-```
-
 # 服务器走代理
 由于远程配置clash太麻烦，采用本地挂梯子，然后SSH反向代理实现
 具体配置已经写进了ssh文件，本机端口7897，服务器代理走7897就行
@@ -73,3 +60,32 @@ unset http_proxy;
 unset https_proxy;
 ```
 
+# Baseline
+为了对比修改后的dreamer效果，考虑其对比方法：pure_dreamer, LOS+ PID, SAC
+
+## SAC部分：
+环境部分参数使用和dreamer相同的参数，主要成功判断依据为track_ratio，同时对比其他若干项目
+
+```bash
+python baselines_sac/train_sac_auv.py \
+  --logdir /home/mayue/logdir/sac_auv/run1 \
+  --steps 2000000 \
+  --n_envs 8 --subproc \
+  --seed 0 \
+  --dt 0.05 --max_steps 800 \
+  --norm_obs \
+  --tb /home/mayue/logdir/tb_sac_auv \
+  --env moving_goal=True \
+  --env goal_delay_steps=5
+
+tensorboard --logdir /home/mayue/logdir/tb_sac_auv
+
+python baselines_sac/eval_sac_auv.py \
+  --model /home/mayue/logdir/sac_auv/run1/sac_final.zip \
+  --vecnorm /home/mayue/logdir/sac_auv/run1/vecnormalize.pkl \
+  --out_dir /home/mayue/logdir/sac_auv/run1/eval_output \
+  --episodes 200 \
+  --success_threshold 0.5 \
+  --track_success_ratio 0.8
+
+```

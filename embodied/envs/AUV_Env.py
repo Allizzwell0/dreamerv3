@@ -373,7 +373,7 @@ class AUVEnv(embodied.Env):
             return np.array([gx, gy], dtype=float)
 
         if self.goal_ctrl_step % self.goal_ctrl_interval == 0:
-            noise = self.np_random.uniform(-1.0, 1.0, size=2)
+            noise = self.np_random.uniform(-0.5, 1.0, size=2)
             target_ctrl = np.array(
                 [noise[0] * self.goal_thrust_scale, noise[1] * self.goal_rudder_max],
                 dtype=float,
