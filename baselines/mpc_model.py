@@ -1,34 +1,87 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+A small linearizable error dynamics model for MPC.
+
+State x = [xb, yb, epsi, u, r]
+Control u_cmd = [thrust_norm, rudder_norm] in [-1, 1]
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
 import numpy as np
 
-def wrap_pi(a):
-    return (a + np.pi) % (2*np.pi) - np.pi
 
-class SimpleAUVModel:
-    """
-    线性/仿射近似模型（baseline 用，参数靠手调/粗辨识）
-    state: [xb, yb, epsi, u, r]
-    action: [thrust_norm, delta_norm]  # 均为 [-1,1]
-    """
-    def __init__(self, dt, cu=0.4, ku=1.0, cr=0.8, kr=1.2, rudder_max=0.6):
-        self.dt = dt
-        self.cu, self.ku = cu, ku
-        self.cr, self.kr = cr, kr
-        self.rudder_max = rudder_max
+@dataclass
+class AUVModelConfig:
+    dt: float = 0.05
 
-    def step(self, s, a, psi_ref):
-        dt = self.dt
-        xb, yb, epsi, u, r = s
-        thrust, delta = a
-        delta = np.clip(delta, -1, 1) * self.rudder_max  # 映射到“物理舵角”量级（近似）
+    # u_dot = -(1/tau_u) * u + k_u * thrust_norm
+    tau_u: float = 0.8
+    k_u: float = 3.0
 
-        # surge / yaw-rate
-        u2 = u + dt * (-self.cu * u + self.ku * thrust)
-        r2 = r + dt * (-self.cr * r + self.kr * delta)
+    # r_dot = -(1/tau_r) * r + k_r * (rudder_max * rudder_norm)
+    tau_r: float = 0.4
+    k_r: float = 6.0
 
-        # 误差运动学（很粗的近似：用 u + epsi 推进误差）
-        epsi2 = wrap_pi(epsi + dt * r2)  # epsi = psi - psi_ref，psi_ref 认为外环给定常值/慢变
-        xb2 = xb - dt * u2 * np.cos(epsi2)   # 朝目标前向误差减少（符号按你定义可调整）
-        yb2 = yb - dt * u2 * np.sin(epsi2)
+    rudder_max: float = 0.6
 
-        # 注意：如果你想更贴合，可直接用 obs 里的 xb,yb 更新方式做线性化
-        return np.array([xb2, yb2, epsi2, u2, r2], dtype=float)
+
+class SimpleAUVErrorModel:
+    def __init__(self, cfg: AUVModelConfig):
+        self.cfg = cfg
+
+    @property
+    def nx(self) -> int:
+        return 5
+
+    @property
+    def nu(self) -> int:
+        return 2
+
+    def linearize(self, x0: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Discrete affine model:
+          X_{k+1} = A X_k + B U_k + c
+
+        Approx kinematics (small-angle):
+          xb_{k+1} = xb_k - dt * u_k
+          yb_{k+1} = yb_k + dt * (u * epsi)  (bilinear)
+
+        Linearize u*epsi around (u0, epsi0):
+          u*epsi ≈ u0*epsi + epsi0*u - u0*epsi0
+        """
+        cfg = self.cfg
+        dt = float(cfg.dt)
+
+        x0 = np.asarray(x0, dtype=float).reshape(-1)
+        assert x0.size == 5, f"x0 must be (5,), got {x0.shape}"
+        _, _, epsi0, u0, _ = x0.tolist()
+
+        A = np.eye(5, dtype=float)
+        B = np.zeros((5, 2), dtype=float)
+        c = np.zeros((5,), dtype=float)
+
+        # xb_{k+1} = xb_k - dt*u
+        A[0, 3] = -dt
+
+        # yb_{k+1} = yb_k + dt*(u*epsi)  (linearized)
+        A[1, 2] = dt * u0
+        A[1, 3] = dt * epsi0
+        c[1] = -dt * u0 * epsi0
+
+        # epsi_{k+1} = epsi_k + dt*r
+        A[2, 4] = dt
+
+        # u_{k+1} = (1 - dt/tau_u) u + dt*k_u*thrust
+        A[3, 3] = 1.0 - dt / max(cfg.tau_u, 1e-6)
+        B[3, 0] = dt * cfg.k_u
+
+        # r_{k+1} = (1 - dt/tau_r) r + dt*k_r*(rudder_max*delta)
+        A[4, 4] = 1.0 - dt / max(cfg.tau_r, 1e-6)
+        B[4, 1] = dt * cfg.k_r * cfg.rudder_max
+
+        return A, B, c

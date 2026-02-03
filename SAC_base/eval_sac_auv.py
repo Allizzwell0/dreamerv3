@@ -1,4 +1,4 @@
-# baselines_sac/eval_sac_auv.py
+# SAC_base/eval_sac_auv.py
 from __future__ import annotations
 
 import argparse
@@ -71,11 +71,14 @@ def evaluate_sac(
     # env
     venv = make_eval_env(dt, max_steps, seed, env_kwargs)
 
+    vecnorm: Optional[VecNormalize] = None
     # VecNormalize：评估时必须 load + 设为 eval 模式（不更新统计量）
     if vecnorm_path is not None and vecnorm_path.exists():
         venv = VecNormalize.load(str(vecnorm_path), venv)
-        venv.training = False
-        venv.norm_reward = False
+        assert isinstance(venv, VecNormalize)
+        vecnorm = venv
+        vecnorm.training = False
+        vecnorm.norm_reward = False
 
     model = SAC.load(str(model_path), env=venv, device="cuda")
 
@@ -85,7 +88,7 @@ def evaluate_sac(
         "x", "y", "theta",
         "u", "v", "r",
         "goal_x", "goal_y",
-        "xe", "ye",
+        "xb", "yb",
         "dist",
         "dist_td", "dist_dot_td",
         "min_dist_td_sofar",
@@ -112,6 +115,12 @@ def evaluate_sac(
 
     overshoot_records: List[Dict[str, Any]] = []
 
+    def _raw_obs(obs_any):
+        if vecnorm is None:
+            return obs_any
+        # VecNormalize stores the unnormalized observation from the latest reset/step
+        return vecnorm.get_original_obs()
+
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
@@ -120,62 +129,117 @@ def evaluate_sac(
             # reset
             ep_seed = int(rng.integers(0, 2**31 - 1))
             obs = venv.reset(seed=ep_seed)
-            # SB3 VecEnv reset returns obs only
-            obs0 = obs[0] if isinstance(obs, tuple) else obs
-            obs_vec = np.asarray(obs0[0], dtype=float)  # (15,)
+            obs_raw = _raw_obs(obs)
+            obs_vec = np.asarray(obs_raw[0], dtype=float)  # (15,)
 
+            # trackers
             ep_return = 0.0
             ep_dists_step: List[float] = []
 
-            # overshoot trackers
             overshoot_found = False
-            overshoot_step = None
-            overshoot_payload = None
+            overshoot_payload: Optional[Dict[str, Any]] = None
             min_dist_td = float("inf")
             min_step = 0
-            prev_dist_td = None
+            prev_dist_td: Optional[float] = None
 
             sum_ex2 = sum_ey2 = sum_hd2 = 0.0
             count_err = 0
 
             last_act = (float("nan"), float("nan"))
 
-            for t in range(0, max_steps + 1):
-                # 解析 vector（按你当前定义）
-                xe, ye, dist = map(float, obs_vec[:3])
+            # --- log t=0 (after reset) ---
+            xb, yb, dist_td_vec = map(float, obs_vec[:3])
+            theta = float(math.atan2(obs_vec[4], obs_vec[3]))
+            u, v, r_val = map(float, obs_vec[5:8])
+            x, y = float(obs_vec[8]), float(obs_vec[9])
+            goal_x, goal_y = float(obs_vec[10]), float(obs_vec[11])
+            phase_cos, phase_sin, t_norm = float(obs_vec[12]), float(obs_vec[13]), float(obs_vec[14])
+
+            dist = float(math.sqrt(xb * xb + yb * yb))
+            dist_td = float(dist_td_vec)
+            dist_dot_td = 0.0
+
+            # init min
+            min_dist_td = dist_td
+            min_step = 0
+            prev_dist_td = dist_td
+
+            # errors
+            err_x = goal_x - x
+            err_y = goal_y - y
+            desired_heading = math.atan2(goal_y - y, goal_x - x)
+            err_heading = _wrap_pi(desired_heading - theta)
+
+            sum_ex2 += err_x * err_x
+            sum_ey2 += err_y * err_y
+            sum_hd2 += err_heading * err_heading
+            count_err += 1
+
+            ep_dists_step.append(dist)
+
+            writer.writerow(
+                [
+                    ep, 0,
+                    0.0,
+                    x, y, theta,
+                    u, v, r_val,
+                    goal_x, goal_y,
+                    xb, yb,
+                    dist,
+                    dist_td, dist_dot_td,
+                    float(min_dist_td),
+                    0,
+                    err_x, err_y, err_heading,
+                    phase_cos, phase_sin, t_norm,
+                    last_act[0], last_act[1],
+                    0,
+                ]
+            )
+
+            done = False
+            step_idx = 0
+
+            # --- rollout ---
+            while (not done) and (step_idx < max_steps):
+                # choose action from *normalized* obs (what the policy expects)
+                action, _ = model.predict(obs, deterministic=True)
+                act = np.asarray(action[0], dtype=float).reshape(-1)
+                act = np.clip(act[:2], -1.0, 1.0)
+                last_act = (float(act[0]), float(act[1]))
+
+                obs, rew, dones, infos = venv.step(action)
+                obs_raw = _raw_obs(obs)
+                obs_vec = np.asarray(obs_raw[0], dtype=float)
+
+                reward = float(rew[0])
+                info = infos[0]
+                done = bool(dones[0])
+
+                ep_return += reward
+                step_idx += 1
+
+                xb, yb, dist_td_vec = map(float, obs_vec[:3])
                 theta = float(math.atan2(obs_vec[4], obs_vec[3]))
                 u, v, r_val = map(float, obs_vec[5:8])
                 x, y = float(obs_vec[8]), float(obs_vec[9])
                 goal_x, goal_y = float(obs_vec[10]), float(obs_vec[11])
                 phase_cos, phase_sin, t_norm = float(obs_vec[12]), float(obs_vec[13]), float(obs_vec[14])
 
-                # 这两个来自 info(log/*)：需要从 VecEnv 的 info 里拿
-                # venv.step() 才会返回 infos，所以 t=0 先写 NaN/默认
-                if t == 0:
-                    reward = 0.0
-                    dist_td = dist
-                    dist_dot_td = 0.0
-                    info = {}
-                    done = False
-                else:
-                    reward = float(rew[0])  # noqa
-                    info = infos[0]  # noqa
-                    done = bool(dones[0])  # noqa
-                    dist_td = float(info.get("log/dist_td", dist))
-                    dist_dot_td = float(info.get("log/dist_dot_td", 0.0))
+                # dist (raw) and dist_td (filtered)
+                dist = float(info.get("log/dist", math.sqrt(xb * xb + yb * yb)))
+                dist_td = float(info.get("log/dist_td", dist_td_vec))
 
-                # dist_dot fallback
-                if "log/dist_dot_td" not in info and t > 0:
-                    if prev_dist_td is None:
-                        dist_dot_td = 0.0
-                    else:
-                        dist_dot_td = (dist_td - prev_dist_td) / max(dt, 1e-8)
+                # dist_dot
+                if "log/dist_dot_td" in info:
+                    dist_dot_td = float(info.get("log/dist_dot_td", 0.0))
+                else:
+                    dist_dot_td = float((dist_td - (prev_dist_td if prev_dist_td is not None else dist_td)) / max(dt, 1e-8))
                 prev_dist_td = dist_td
 
                 # update min
                 if dist_td < min_dist_td:
                     min_dist_td = dist_td
-                    min_step = t
+                    min_step = step_idx
 
                 # errors
                 err_x = goal_x - x
@@ -190,9 +254,9 @@ def evaluate_sac(
 
                 ep_dists_step.append(dist)
 
-                # overshoot detection
+                # overshoot detection (first time only)
                 is_overshoot_step = detect_first_overshoot(
-                    t=t,
+                    t=step_idx,
                     dist_td=dist_td,
                     dist_dot_td=dist_dot_td,
                     min_dist_td=min_dist_td,
@@ -204,28 +268,27 @@ def evaluate_sac(
                 )
                 if is_overshoot_step and not overshoot_found:
                     overshoot_found = True
-                    overshoot_step = t
                     overshoot_payload = dict(
                         episode=ep,
-                        overshoot_step=t,
-                        min_step=min_step,
+                        overshoot_step=step_idx,
+                        min_step=int(min_step),
                         min_dist_td=float(min_dist_td),
                         dist_td=float(dist_td),
                         dist_dot_td=float(dist_dot_td),
                         x=float(x), y=float(y), theta=float(theta),
                         goal_x=float(goal_x), goal_y=float(goal_y),
                         u=float(u), v=float(v), r=float(r_val),
-                        xe=float(xe), ye=float(ye), dist=float(dist),
+                        xb=float(xb), yb=float(yb), dist=float(dist),
                     )
 
                 writer.writerow(
                     [
-                        ep, t,
+                        ep, step_idx,
                         reward,
                         x, y, theta,
                         u, v, r_val,
                         goal_x, goal_y,
-                        xe, ye,
+                        xb, yb,
                         dist,
                         dist_td, dist_dot_td,
                         float(min_dist_td),
@@ -237,24 +300,9 @@ def evaluate_sac(
                     ]
                 )
 
-                if done:
-                    ep_return += reward
-                    break
-
-                # 走一步（t>=0 都需要产生 action，但我们把 action 记录到下一行显示）
-                action, _ = model.predict(obs, deterministic=True)
-                act = np.asarray(action[0], dtype=float).reshape(-1)
-                act = np.clip(act[:2], -1.0, 1.0)
-                last_act = (float(act[0]), float(act[1]))
-
-                obs, rew, dones, infos = venv.step(action)  # noqa
-                obs_vec = np.asarray(obs[0], dtype=float)
-
-                ep_return += reward
-
             # episode summary
             ep_returns.append(ep_return)
-            ep_lengths.append(t)
+            ep_lengths.append(step_idx)
             final_dists.append(float(ep_dists_step[-1]) if ep_dists_step else float("nan"))
 
             ep_dists_arr = np.array(ep_dists_step, dtype=float) if ep_dists_step else np.array([np.nan])
@@ -318,6 +366,7 @@ def evaluate_sac(
         "rmse_heading_std": float(np.std(rmse_heading_list)) if rmse_heading_list else float("nan"),
     }
     return metrics
+
 
 
 def parse_kv_list(kvs: List[str]) -> Dict[str, Any]:

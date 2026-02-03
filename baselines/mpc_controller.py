@@ -1,83 +1,163 @@
-import numpy as np
-import cvxpy as cp
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+QP-MPC controller using cvxpy + OSQP.
 
-def wrap_pi(a):
-    return (a + np.pi) % (2*np.pi) - np.pi
+Minimize:
+  xb, yb, epsi, (u-u_ref), r
+  + control magnitude and control rate for smoothness
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
+
+try:
+    import cvxpy as cp
+except Exception as e:
+    cp = None
+    _CVXPY_IMPORT_ERR = e
+
+from mpc_model import SimpleAUVErrorModel
+
+
+@dataclass
+class MPCConfig:
+    horizon: int = 20
+
+    # weights
+    w_x: float = 0.2
+    w_y: float = 2.0
+    w_psi: float = 1.5
+    w_u: float = 0.8
+    w_r: float = 0.2
+
+    w_act: float = 1e-2
+    w_dact: float = 5e-2
+
+    # constraints
+    u_limit: float = 5.0
+    r_limit: float = 3.0
+    dthrust_limit: float = 0.3
+    ddelta_limit: float = 0.3
+
+    solver: str = "OSQP"
+
 
 class MPCController:
-    def __init__(self, model, H=20,
-                 w_y=5.0, w_psi=2.0, w_u=1.0, w_du=0.05, w_dd=0.1,
-                 thrust_lim=1.0, delta_lim=1.0, dthrust_lim=0.2, ddelta_lim=0.2):
-        self.m = model
-        self.H = H
-        self.w_y, self.w_psi, self.w_u = w_y, w_psi, w_u
-        self.w_du, self.w_dd = w_du, w_dd
-        self.thrust_lim, self.delta_lim = thrust_lim, delta_lim
-        self.dthrust_lim, self.ddelta_lim = dthrust_lim, ddelta_lim
+    def __init__(self, model: SimpleAUVErrorModel, cfg: MPCConfig):
+        if cp is None:
+            raise ImportError(
+                "cvxpy is required for MPCController but import failed: "
+                f"{_CVXPY_IMPORT_ERR}"
+            )
+        self.model = model
+        self.cfg = cfg
 
-        # cvxpy variables
-        self.X = cp.Variable((5, H+1))
-        self.U = cp.Variable((2, H))
-        self.X0 = cp.Parameter(5)
-        self.PSIREF = cp.Parameter()     # scalar
-        self.UREF = cp.Parameter()       # scalar
-        self.U_PREV = cp.Parameter(2)    # prev action (rate constraints)
+        nx, nu = model.nx, model.nu
+        H = int(cfg.horizon)
 
-        self.prob = self._build_problem()
+        # Variables
+        self.X = cp.Variable((nx, H + 1))
+        self.U = cp.Variable((nu, H))
 
-    def _build_problem(self):
+        # Parameters
+        self.X0 = cp.Parameter(nx)
+        self.u_ref = cp.Parameter(nonneg=True)
+        self.U_prev = cp.Parameter(nu)
+
+        self.A = cp.Parameter((nx, nx))
+        self.B = cp.Parameter((nx, nu))
+        self.c = cp.Parameter(nx)
+
         cost = 0
-        cons = [self.X[:,0] == self.X0]
-        for k in range(self.H):
-            xb, yb, epsi, u, r = self.X[:,k]
-            thrust, delta = self.U[:,k]
+        cons = [self.X[:, 0] == self.X0]
 
-            # stage cost (focus y error + heading error + speed tracking)
-            cost += self.w_y * cp.square(yb)
-            cost += self.w_psi * cp.square(epsi)
-            cost += self.w_u * cp.square(u - self.UREF)
+        for k in range(H):
+            xb = self.X[0, k]
+            yb = self.X[1, k]
+            epsi = self.X[2, k]
+            u = self.X[3, k]
+            r = self.X[4, k]
 
-            # smoothness
-            if k == 0:
-                du = self.U[:,k] - self.U_PREV
-            else:
-                du = self.U[:,k] - self.U[:,k-1]
-            cost += self.w_du * cp.square(du[0]) + self.w_dd * cp.square(du[1])
+            uk = self.U[:, k]
 
-            # action bounds
-            cons += [
-                cp.abs(thrust) <= self.thrust_lim,
-                cp.abs(delta)  <= self.delta_lim,
-            ]
-            # rate bounds
-            cons += [
-                cp.abs(du[0]) <= self.dthrust_lim,
-                cp.abs(du[1]) <= self.ddelta_lim,
-            ]
+            # dynamics
+            cons += [self.X[:, k + 1] == self.A @ self.X[:, k] + self.B @ uk + self.c]
 
-            # dynamics (use python function -> need linear/affine form for strict QP;
-            # baseline里你可以直接把 step 展开成仿射近似，或先用小角度线性化。
-            # 这里给“框架”，实际你需要把 model.step() 线性化写成 A,B,c。
-            raise NotImplementedError("Fill in linearized dynamics: X_{k+1} = A X_k + B U_k + c")
+            # input bounds
+            cons += [uk <= 1.0, uk >= -1.0]
 
-        prob = cp.Problem(cp.Minimize(cost), cons)
-        return prob
+            # state bounds
+            cons += [cp.abs(u) <= cfg.u_limit]
+            cons += [cp.abs(r) <= cfg.r_limit]
 
-    def act(self, obs_vec, psi_ref, u_ref, prev_action):
-        xb, yb = float(obs_vec[0]), float(obs_vec[1])
-        theta = np.arctan2(float(obs_vec[4]), float(obs_vec[3]))
-        u = float(obs_vec[5]); r = float(obs_vec[7])
+            # rate limits
+            du = uk - (self.U_prev if k == 0 else self.U[:, k - 1])
+            cons += [cp.abs(du[0]) <= cfg.dthrust_limit]
+            cons += [cp.abs(du[1]) <= cfg.ddelta_limit]
 
-        epsi = wrap_pi(theta - psi_ref)
-        x0 = np.array([xb, yb, epsi, u, r], dtype=float)
+            # stage cost
+            cost += cfg.w_x * cp.square(xb)
+            cost += cfg.w_y * cp.square(yb)
+            cost += cfg.w_psi * cp.square(epsi)
+            cost += cfg.w_u * cp.square(u - self.u_ref)
+            cost += cfg.w_r * cp.square(r)
 
-        # set params
+            cost += cfg.w_act * cp.sum_squares(uk)
+            cost += cfg.w_dact * cp.sum_squares(du)
+
+        # terminal cost
+        xbT, ybT, epsiT, uT, rT = self.X[:, H]
+        cost += 0.5 * cfg.w_x * cp.square(xbT)
+        cost += 1.0 * cfg.w_y * cp.square(ybT)
+        cost += 1.0 * cfg.w_psi * cp.square(epsiT)
+        cost += 0.5 * cfg.w_u * cp.square(uT - self.u_ref)
+        cost += 0.2 * cfg.w_r * cp.square(rT)
+
+        self.prob = cp.Problem(cp.Minimize(cost), cons)
+
+    def act(
+        self,
+        *,
+        x0: np.ndarray,
+        u_ref: float,
+        u_prev: np.ndarray,
+        warm_start: bool = True,
+        max_iter: int = 10_000,
+    ) -> Tuple[np.ndarray, dict]:
+        x0 = np.asarray(x0, dtype=float).reshape(-1)
+        u_prev = np.asarray(u_prev, dtype=float).reshape(-1)
+
+        A, B, c = self.model.linearize(x0)
+
         self.X0.value = x0
-        self.PSIREF.value = float(psi_ref)
-        self.UREF.value = float(u_ref)
-        self.U_PREV.value = np.array(prev_action, dtype=float)
+        self.u_ref.value = float(max(0.0, u_ref))
+        self.U_prev.value = u_prev
+        self.A.value = A
+        self.B.value = B
+        self.c.value = c
 
-        # solve
-        self.prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
-        u0 = np.array(self.U.value[:,0]).reshape(-1)
-        return np.clip(u0, -1.0, 1.0)
+        info = {"status": None, "obj": None}
+        try:
+            self.prob.solve(
+                solver=getattr(cp, self.cfg.solver),
+                warm_start=warm_start,
+                max_iter=max_iter,
+                verbose=False,
+            )
+            info["status"] = self.prob.status
+            info["obj"] = float(self.prob.value) if self.prob.value is not None else None
+
+            if self.prob.status not in ("optimal", "optimal_inaccurate"):
+                return np.clip(u_prev, -1.0, 1.0), info
+
+            u0 = np.asarray(self.U.value[:, 0], dtype=float).reshape(-1)
+            return np.clip(u0, -1.0, 1.0), info
+
+        except Exception as e:
+            info["status"] = f"error:{e}"
+            return np.clip(u_prev, -1.0, 1.0), info

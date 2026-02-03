@@ -61,26 +61,25 @@ unset https_proxy;
 ```
 
 # Baseline
-为了对比修改后的dreamer效果，考虑其对比方法：pure_dreamer, LOS+ PID, SAC
+为了对比修改后的dreamer效果，考虑其对比方法：pure_dreamer, LOS+ MPC, SAC
 
 ## SAC部分：
 环境部分参数使用和dreamer相同的参数，主要成功判断依据为track_ratio，同时对比其他若干项目
 
 ```bash
-python baselines_sac/train_sac_auv.py \
+python train_sac_auv.py \
   --logdir /home/mayue/logdir/sac_auv/run1 \
-  --steps 2000000 \
-  --n_envs 8 --subproc \
-  --seed 0 \
-  --dt 0.05 --max_steps 800 \
+  --steps 20000000 \
+  --n_envs 8 \
   --norm_obs \
-  --tb /home/mayue/logdir/tb_sac_auv \
+  --tb /home/mayue/logdir/sac_auv/tb \
   --env moving_goal=True \
-  --env goal_delay_steps=5
+  --env max_goal_speed=2.0 \
+  --env max_goal_turn_rate=1.2
 
 tensorboard --logdir /home/mayue/logdir/tb_sac_auv
 
-python baselines_sac/eval_sac_auv.py \
+python SAC_base/eval_sac_auv.py \
   --model /home/mayue/logdir/sac_auv/run1/sac_final.zip \
   --vecnorm /home/mayue/logdir/sac_auv/run1/vecnormalize.pkl \
   --out_dir /home/mayue/logdir/sac_auv/run1/eval_output \
@@ -89,3 +88,7 @@ python baselines_sac/eval_sac_auv.py \
   --track_success_ratio 0.8
 
 ```
+
+## traditional 部分
+
+学习mpc部分，考虑使用线性还是非线性

@@ -1,0 +1,14 @@
+{
+  "episodes": 50,
+  "success_rate": 0.0,
+  "success_count": 0,
+  "avg_return": -1880.2351788703352,
+  "std_return": 75.89794990066918,
+  "avg_ep_len": 800.0,
+  "mean_dist_mean": 8.475749538669449,
+  "mean_dist_std": 3.5396336034680274,
+  "max_dist_mean": 16.508386405650544,
+  "track_ratio_mean": 0.013857677902621721,
+  "track_ratio_std": 0.02151557811060993,
+  "csv_path": "/home/mayue/WorldModel/Dreamer/dreamerv3/baselines/los_mpc_out_moving/trajectories.csv"
+}
