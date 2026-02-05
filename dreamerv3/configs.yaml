@@ -153,6 +153,7 @@ defaults:
     conf_low_eta_gamma: 1.2117864684004653
     conf_low_tau: 0.4615729953193636
     conf_pos_scale: 10.0
+    pred_horizon: 30
 
 
 size1m: &size1m

@@ -35,10 +35,10 @@ MAIN_SCRIPT = ROOT / "dreamerv3" / "main.py"
 TASK_NAME = "auv_custom"
 CONFIG_NAME = "auv"
 
-BASE_LOGDIR = Path("/home/mayue/logdir/pbt_conf_auv_4")
+BASE_LOGDIR = Path("/home/mayue/logdir/pbt_conf_auv_5")
 
 POP_SIZE = 5
-GENERATIONS = 6
+GENERATIONS = 8
 STEPS_PER_GEN = int(1e6)
 
 HP_BOUNDS: Dict[str, Tuple[float, float]] = {
@@ -59,7 +59,7 @@ HP_BOUNDS: Dict[str, Tuple[float, float]] = {
     "agent.conf_low_eta_max": (0.5, 1.0),
     "agent.conf_low_eta_gamma": (0.5, 2.0),
     "agent.conf_low_tau": (0.1, 1.0),
-    "agent.conf_pos_scale": (1.0, 20.0),
+    "agent.conf_pos_scale": (1.0, 2.0),
     # "agent.conf_k_thrust": (0.02, 0.6),
     # "agent.conf_k_rudder": (0.2, 4.0),
 }
@@ -81,7 +81,7 @@ BEST_HP: Dict[str, float] = {
     "agent.conf_low_eta_max": 1.0,
     "agent.conf_low_eta_gamma": 0.8900519329630249,
     "agent.conf_low_tau": 0.24972999467728338,
-    "agent.conf_pos_scale": 10.0,
+    "agent.conf_pos_scale": 1.0,
     # "agent.conf_k_thrust": 0.3,
     # "agent.conf_k_rudder": 2.0,
 }

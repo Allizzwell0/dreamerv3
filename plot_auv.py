@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Optional
 
@@ -33,6 +34,26 @@ def _to_float(value: str, default: float = np.nan) -> float:
         return float(value)
     except Exception:
         return default
+
+def _parse_xy_list(value: str) -> np.ndarray:
+    """Parse JSON list-of-pairs into (H,2) array; return empty (0,2) if missing."""
+    if value is None:
+        return np.zeros((0, 2), dtype=float)
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return np.zeros((0, 2), dtype=float)
+    try:
+        obj = json.loads(s)
+        arr = np.asarray(obj, dtype=float)
+    except Exception:
+        return np.zeros((0, 2), dtype=float)
+    arr = np.squeeze(arr)
+    if arr.ndim == 1 and arr.size == 2:
+        arr = arr.reshape(1, 2)
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return arr
+    return np.zeros((0, 2), dtype=float)
+
 
 
 def group_rows_by_episode(rows: Iterable[Dict[str, str]]) -> Dict[int, List[Dict[str, str]]]:
@@ -96,6 +117,17 @@ def prepare_episode_arrays(rows: List[Dict[str, str]], fieldnames: List[str]) ->
         data["acts"] = acts
         data["act_cols"] = np.array(act_cols, dtype=object)
 
+
+    # Optional: WM prediction columns (from eval_auv_wm30.py)
+    if "wm_conf" in fieldnames:
+        data["wm_conf"] = arr("wm_conf")
+    if "wm_mse_local" in fieldnames:
+        data["wm_mse_local"] = arr("wm_mse_local")
+    if "wm_pred_goal_xy" in fieldnames:
+        data["wm_pred_goal_xy_list"] = np.array(
+            [_parse_xy_list(r.get("wm_pred_goal_xy", "")) for r in rows_sorted],
+            dtype=object,
+        )
     return data
 
 
@@ -459,6 +491,7 @@ def create_episode_animation(
     (line_auv,) = ax_traj.plot([], [], linewidth=2.0, label="AUV path")
     (point_auv,) = ax_traj.plot([], [], marker="o", markersize=6)
     (point_goal,) = ax_traj.plot([], [], marker="x", markersize=6)
+    (line_pred_goal,) = ax_traj.plot([], [], linestyle=":", linewidth=1.5, alpha=0.9, label="WM pred goal (30)")
 
     ax_traj.legend(loc="best")
 
@@ -529,6 +562,7 @@ def create_episode_animation(
         line_auv.set_data([], [])
         point_auv.set_data([], [])
         point_goal.set_data([], [])
+        line_pred_goal.set_data([], [])
         line_dist.set_data([], [])
         line_ex.set_data([], [])
         line_ey.set_data([], [])
@@ -539,6 +573,7 @@ def create_episode_animation(
             line_auv,
             point_auv,
             point_goal,
+            line_pred_goal,
             line_dist,
             line_ex,
             line_ey,
@@ -556,6 +591,17 @@ def create_episode_animation(
             point_goal.set_data([gx[i]], [gy[i]])  # ★ 必须是序列
         else:
             point_goal.set_data([], [])
+
+            # WM predicted future goal trajectory (world frame)
+            pred_list = data.get("wm_pred_goal_xy_list", None)
+            if pred_list is not None and len(pred_list) > i:
+                pred_xy = pred_list[i]
+                if isinstance(pred_xy, np.ndarray) and pred_xy.size >= 2:
+                    line_pred_goal.set_data(pred_xy[:, 0], pred_xy[:, 1])
+                else:
+                    line_pred_goal.set_data([], [])
+            else:
+                line_pred_goal.set_data([], [])
 
         # 误差 + 动作
         tt = t[: i + 1]
@@ -575,6 +621,13 @@ def create_episode_animation(
             f"err_y = {err_y[i]:.3f}",
             f"err_heading = {err_h[i]:.3f} rad",
         ]
+        wm_conf_arr = data.get("wm_conf", None)
+        wm_mse_arr = data.get("wm_mse_local", None)
+        if wm_conf_arr is not None and i < len(wm_conf_arr) and not np.isnan(wm_conf_arr[i]):
+            msg_lines.append(f"wm_conf = {wm_conf_arr[i]:.3f}")
+        if wm_mse_arr is not None and i < len(wm_mse_arr) and not np.isnan(wm_mse_arr[i]):
+            msg_lines.append(f"wm_mse_local = {wm_mse_arr[i]:.6f}")
+
         if acts is not None and acts.size > 0:
             act_vals = ", ".join(f"{acts[i, j]:.3f}" for j in range(acts.shape[1]))
             msg_lines.append(f"acts: {act_vals}")
@@ -584,6 +637,7 @@ def create_episode_animation(
             line_auv,
             point_auv,
             point_goal,
+            line_pred_goal,
             line_dist,
             line_ex,
             line_ey,

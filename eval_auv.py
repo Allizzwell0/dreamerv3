@@ -54,6 +54,164 @@ except Exception as e:
 def _wrap_pi(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
+def _safe_float1(x, default=float("nan")) -> float:
+    try:
+        arr = np.asarray(x)
+        return float(arr.reshape(-1)[0])
+    except Exception:
+        return default
+
+
+def _parse_pred_local(outs: Any) -> Optional[np.ndarray]:
+    """Return (H,11) local trajectory or None."""
+    if not outs or not isinstance(outs, dict):
+        return None
+    key = "log/wm_pred_local_traj"
+    if key not in outs:
+        return None
+    arr = np.asarray(outs[key])
+    arr = np.squeeze(arr)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 2 and arr.shape[1] == 11:
+        return arr.astype(np.float32)
+    return None
+
+
+def _debug_print_decoder_outputs(
+    *,
+    ep: int,
+    t: int,
+    traj: Dict[str, Any],
+    outs_now: Dict[str, Any],
+    pos_scale: float = 10.0,
+    only_vector: bool = False,
+):
+    """Pretty-print decoder preds vs true obs and their error for debugging."""
+    prefix = "debug/dec_pred/"
+    keys = [k for k in outs_now.keys() if isinstance(k, str) and k.startswith(prefix)]
+    if only_vector:
+        keys = [k for k in keys if k[len(prefix):] == "vector"]
+    keys = sorted(keys)
+    if not keys:
+        print(f"[DEC DEBUG] ep={ep} t={t} (no decoder outputs in outs; did you copy agent_wm30.py?)")
+        return
+
+    # Vector dim names (AUVEnv)
+    vec_names = [
+        "xb", "yb", "dist_td",
+        "cos(theta)", "sin(theta)",
+        "u", "v", "r",
+        "x", "y", "gx", "gy",
+        "phase_cos", "phase_sin", "t_norm",
+    ]
+
+    print("\n" + "=" * 90)
+    print(f"[DEC DEBUG] ep={ep} t={t}")
+
+    for k in keys:
+        obs_key = k[len(prefix):]
+        pred = np.asarray(outs_now[k])
+        pred = np.squeeze(pred)
+        # If (B, ...), take first batch
+        if pred.ndim >= 1 and pred.shape[0] == 1:
+            pred = np.squeeze(pred, axis=0)
+
+        true = traj.get(obs_key, None)
+        if true is None:
+            print(f"  - {obs_key}: true obs not found in traj keys")
+            continue
+        true = np.asarray(true)
+        true = np.squeeze(true)
+
+        # Compute error when numeric
+        err = None
+        try:
+            err = (pred.astype(np.float64) - true.astype(np.float64))
+        except Exception:
+            err = None
+
+        if obs_key == "vector" and pred.ndim == 1 and pred.shape[0] == 15:
+            # Pretty print per-dim
+            print("  - vector(15):")
+            for i, name in enumerate(vec_names):
+                p = float(pred[i])
+                q = float(true[i])
+                e = float(err[i]) if err is not None else float("nan")
+                print(f"      [{i:02d}] {name:>10s} | pred={p: .5f}  true={q: .5f}  err={e: .5f}")
+
+            # Also print the exact local-mse used in gating (scaled pos dims)
+            pos_idx = [0, 1, 2]
+            rest_idx = [3, 4, 5, 6, 7, 12, 13, 14]
+            ppos = pred[pos_idx]
+            qpos = true[pos_idx]
+            prest = pred[rest_idx]
+            qrest = true[rest_idx]
+            err_pos_scaled = (ppos - qpos) / max(pos_scale, 1e-6)
+            err_rest = (prest - qrest)
+            err_local = np.concatenate([err_pos_scaled, err_rest], axis=0)
+            mse_local = float(np.mean(err_local ** 2))
+            wm_mse = _safe_float1(outs_now.get("log/wm_mse_vec_policy", np.nan))
+            wm_conf = _safe_float1(outs_now.get("log/wm_conf", np.nan))
+            print(f"    -> gating_mse(recomputed, pos_scale={pos_scale:g}) = {mse_local:.6g} | outs wm_mse={wm_mse:.6g} wm_conf={wm_conf:.6g}")
+        else:
+            # Scalar or other shapes
+            if pred.ndim == 0:
+                p = float(pred)
+                q = float(true)
+                e = float(err) if err is not None else float("nan")
+                print(f"  - {obs_key}: pred={p:.6g} true={q:.6g} err={e:.6g}")
+            else:
+                # Short summary for arrays
+                absmax = float(np.max(np.abs(err))) if err is not None else float("nan")
+                meanabs = float(np.mean(np.abs(err))) if err is not None else float("nan")
+                print(f"  - {obs_key}: shape={pred.shape} absmax(err)={absmax:.6g} meanabs(err)={meanabs:.6g}")
+
+    print("=" * 90)
+
+
+def _pred_world_from_local(x0: float, y0: float, theta0: float, pred_local: np.ndarray, dt: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    From predicted local trajectory (H,11):
+      0 xb, 1 yb, 2 dist_td, 3 cos, 4 sin, 5 u, 6 v, 7 r, 8 phase_cos, 9 phase_sin, 10 t_norm
+    Integrate AUV pose using (u,v,r) and compute predicted goal world coords using (xb,yb).
+    Returns:
+      goal_xy: (H,2)
+      auv_xy:  (H,2)
+    """
+    H = int(pred_local.shape[0])
+    xb = pred_local[:, 0]
+    yb = pred_local[:, 1]
+    u = pred_local[:, 5]
+    v = pred_local[:, 6]
+    r = pred_local[:, 7]
+
+    x = float(x0)
+    y = float(y0)
+    th = float(theta0)
+
+    goal_xy = np.zeros((H, 2), dtype=np.float32)
+    auv_xy = np.zeros((H, 2), dtype=np.float32)
+
+    for k in range(H):
+        c = math.cos(th)
+        s = math.sin(th)
+        x += (c * float(u[k]) - s * float(v[k])) * dt
+        y += (s * float(u[k]) + c * float(v[k])) * dt
+        th = _wrap_pi(th + float(r[k]) * dt)
+
+        c = math.cos(th)
+        s = math.sin(th)
+        gx = x + c * float(xb[k]) - s * float(yb[k])
+        gy = y + s * float(xb[k]) + c * float(yb[k])
+
+        auv_xy[k, 0] = x
+        auv_xy[k, 1] = y
+        goal_xy[k, 0] = gx
+        goal_xy[k, 1] = gy
+
+    return goal_xy, auv_xy
+
 
 # ------------ continuous-action fallback policy ------------
 
@@ -230,9 +388,11 @@ def load_trained_policy(
                 self.act_shape = tuple(act_shape_)
                 self.carry = None
                 self.rng = np.random.default_rng(seed_)
+                self.last_outs = None
 
             def reset(self) -> None:
                 self.carry = self.agent.init_policy(batch_size=1)
+                self.last_outs = None
 
             def __call__(self, obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
                 if self.carry is None:
@@ -243,6 +403,7 @@ def load_trained_policy(
                 obs_batched = {k: np.asarray(v)[None] for k, v in obs_filtered.items()}
 
                 self.carry, acts, outs = self.agent.policy(self.carry, obs_batched, mode="eval")
+                self.last_outs = outs
 
                 if "action" not in acts:
                     raise RuntimeError(f"'action' not found in policy acts keys: {list(acts.keys())}")
@@ -304,6 +465,13 @@ def evaluate_auv(
     overshoot_eps: float = 0.2,
     overshoot_min_steps: int = 20,
     overshoot_require_distdot: bool = True,
+    # debug decoder
+    debug_decoder: bool = False,
+    debug_episode: int = 0,
+    debug_steps: int = 5,
+    debug_every: int = 1,
+    debug_only_vector: bool = False,
+    debug_pos_scale: float = 10.0,
 ) -> Dict[str, float]:
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -343,6 +511,7 @@ def evaluate_auv(
         "err_x", "err_y", "err_heading",
         "phase_cos", "phase_sin", "t_norm",
         "action_0", "action_1",
+        "wm_conf", "wm_mse_local", "wm_pred_xy_body", "wm_pred_goal_xy", "wm_pred_auv_xy",
         "is_terminal", "is_last",
     ]
 
@@ -449,6 +618,22 @@ def evaluate_auv(
                 # record distance stats (use raw dist for your original metrics)
                 ep_dists_step.append(dist)
 
+                # --- Query policy for this step (for next transition + WM prediction) ---
+                # Call policy here so its outs align with the current CSV row.
+                if not is_last:
+                    _action_for_step = policy(traj)
+                    _raw_act = np.asarray(_action_for_step.get("action", np.zeros(act_shape)), dtype=float).reshape(-1)
+                    if _raw_act.size == 1:
+                        _raw_act = np.array([_raw_act.item(), 0.0], dtype=float)
+                    else:
+                        _raw_act = _raw_act[:2]
+                    next_action = _action_for_step
+                    next_raw_act = (float(_raw_act[0]), float(_raw_act[1]))
+                else:
+                    next_action = None
+                    next_raw_act = (float("nan"), float("nan"))
+
+
                 # overshoot detection
                 is_overshoot_step = detect_first_overshoot(
                     t=t,
@@ -477,6 +662,40 @@ def evaluate_auv(
                         xe=float(xe), ye=float(ye), dist=float(dist),
                     )
 
+                # --- WM future prediction (world frame) from policy outs ---
+                wm_conf = wm_mse_local = float("nan")
+                wm_pred_xy_body_json = "[]"
+                wm_pred_goal_xy_json = "[]"
+                wm_pred_auv_xy_json = "[]"
+
+                outs_now = getattr(policy, "last_outs", None)
+                if outs_now and isinstance(outs_now, dict):
+                    # Optional: print decoder predictions vs true obs for easy sanity checks.
+                    if (
+                        debug_decoder
+                        and ep == int(debug_episode)
+                        and t < int(debug_steps)
+                        and (int(debug_every) <= 1 or (t % int(debug_every) == 0))
+                    ):
+                        _debug_print_decoder_outputs(
+                            ep=ep,
+                            t=t,
+                            traj=traj,
+                            outs_now=outs_now,
+                            pos_scale=float(debug_pos_scale),
+                            only_vector=bool(debug_only_vector),
+                        )
+
+                    wm_conf = _safe_float1(outs_now.get("log/wm_conf", np.nan))
+                    wm_mse_local = _safe_float1(outs_now.get("log/wm_mse_vec_policy", np.nan))
+                    pred_local = _parse_pred_local(outs_now)
+                    if pred_local is not None:
+                        wm_pred_xy_body_json = json.dumps(pred_local[:, 0:2].astype(float).tolist())
+                        if not (math.isnan(x) or math.isnan(y)):
+                            goal_xy, auv_xy = _pred_world_from_local(x, y, theta, pred_local, dt)
+                            wm_pred_goal_xy_json = json.dumps(goal_xy.astype(float).tolist())
+                            wm_pred_auv_xy_json = json.dumps(auv_xy.astype(float).tolist())
+
                 # action: at t=0, no action yet (after reset), so write NaN
                 if t == 0:
                     a0 = a1 = float("nan")
@@ -501,6 +720,7 @@ def evaluate_auv(
                         phase_cos, phase_sin, t_norm,
                         a0, a1,
                         is_terminal, is_last,
+                        wm_conf, wm_mse_local, wm_pred_xy_body_json, wm_pred_goal_xy_json, wm_pred_auv_xy_json,
                     ]
                 )
 
@@ -509,15 +729,9 @@ def evaluate_auv(
                     ep_return += reward
                     break
 
-                # step env with policy action (except at t=0 we haven't acted yet)
-                action = policy(traj)
-                raw_act = np.asarray(action.get("action", np.zeros(act_shape)), dtype=float).reshape(-1)
-                if raw_act.size == 1:
-                    raw_act = np.array([raw_act.item(), 0.0], dtype=float)
-                else:
-                    raw_act = raw_act[:2]
-                last_raw_act = (float(raw_act[0]), float(raw_act[1]))  # for CSV row at next t
-                traj = env.step(action)
+                # step env with the action computed earlier for this transition
+                last_raw_act = next_raw_act  # for CSV row at next t
+                traj = env.step(next_action)
                 ep_return += reward
 
             # episode summary
@@ -625,6 +839,14 @@ def main():
     parser.add_argument("--no_overshoot_require_distdot", action="store_false", dest="overshoot_require_distdot")
     parser.set_defaults(overshoot_require_distdot=True)
 
+    # debug: print decoder predictions vs obs for sanity checks
+    parser.add_argument("--debug_decoder", action="store_true", help="Print decoder preds vs true obs and their errors")
+    parser.add_argument("--debug_episode", type=int, default=0, help="Which episode index to print")
+    parser.add_argument("--debug_steps", type=int, default=5, help="How many steps to print in that episode")
+    parser.add_argument("--debug_every", type=int, default=1, help="Print every N steps (within debug_steps)")
+    parser.add_argument("--debug_only_vector", action="store_true", help="Only print vector decoder output")
+    parser.add_argument("--debug_pos_scale", type=float, default=10.0, help="pos_scale used in gating MSE recomputation")
+
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).expanduser()
@@ -643,6 +865,12 @@ def main():
         overshoot_eps=args.overshoot_eps,
         overshoot_min_steps=args.overshoot_min_steps,
         overshoot_require_distdot=args.overshoot_require_distdot,
+        debug_decoder=args.debug_decoder,
+        debug_episode=args.debug_episode,
+        debug_steps=args.debug_steps,
+        debug_every=args.debug_every,
+        debug_only_vector=args.debug_only_vector,
+        debug_pos_scale=args.debug_pos_scale,
     )
 
     if args.summary_json:

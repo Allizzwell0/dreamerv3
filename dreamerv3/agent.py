@@ -195,6 +195,55 @@ class Agent(embodied.jax.Agent):
         out['log/wm_conf'] = conf.squeeze(-1)
         out['log/wm_mse_vec_policy'] = mse.squeeze(-1)
 
+        # ======== DEBUG: dump decoder predictions (for eval-side printing) ========
+        # Default enabled to help debugging; set config.agent.wm_debug_decoder=False to disable.
+        debug_dec = bool(getattr(conf_cfg, 'wm_debug_decoder', True))
+        if debug_dec:
+          for _k, _recon in recons.items():
+            try:
+              _pred = _recon.pred()
+            except Exception:
+              # Some distributions might not implement pred(); skip them.
+              continue
+            # Keep batch dimension; eval wrapper will squeeze/convert.
+            out[f'debug/dec_pred/{_k}'] = _pred
+
+        # ======== WM multi-step prediction (local dims used in mse) ========
+        # Predict future local trajectory for visualization/evaluation.
+        # Local dims subset: [xb, yb, dist_td, cos, sin, u, v, r, phase_cos, phase_sin, t_norm]
+        pred_h = int(getattr(conf_cfg, 'wm_pred_horizon', 30))
+        if pred_h > 0:
+          # Build starts from current posterior state (single step -> add time axis).
+          dyn_entries1 = jax.tree.map(lambda x: x[:, None], dyn_entry)
+          starts = self.dyn.starts(dyn_entries1, dyn_carry, 1)
+
+          # Deterministic action for imagination (avoid consuming RNG in eval).
+          def policyfn(feat_):
+            d = self.pol(self.feat2tensor(feat_), bdims=1)
+            def pick(x):
+              if hasattr(x, 'mode'):
+                return x.mode()
+              if hasattr(x, 'mean'):
+                return x.mean()
+              if hasattr(x, 'pred'):
+                return x.pred()
+              return x.sample(nj.seed())
+            return jax.tree.map(pick, d)
+
+          _, imgfeat, _ = self.dyn.imagine(starts, policyfn, pred_h, training=False)
+
+          # Decode imagined features; no resets inside imagined rollout.
+          B = reset.shape[0]
+          reset0 = jnp.zeros((B, pred_h), dtype=reset.dtype)
+          _dec_carry2, _dec_entry2, imgrecons = self.dec(dec_carry, imgfeat, reset0, training=False)
+
+          if 'vector' in imgrecons:
+            pred_vec_h = imgrecons['vector'].pred()  # (B, H, D)
+            local_idx = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14]
+            pred_local = pred_vec_h[..., local_idx]  # (B, H, 11)
+            out['log/wm_pred_local_traj'] = pred_local
+            out['log/wm_pred_xy_body'] = pred_local[..., :2]
+
     # finite
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
