@@ -91,6 +91,8 @@ def prepare_episode_arrays(rows: List[Dict[str, str]], fieldnames: List[str]) ->
         # 目标轨迹
         "goal_x": arr("goal_x"),
         "goal_y": arr("goal_y"),
+        "goal_vx": arr("goal_vx", default=np.nan) if "goal_vx" in fieldnames else None,
+        "goal_vy": arr("goal_vy", default=np.nan) if "goal_vy" in fieldnames else None,
         # 误差（与 eval_auv.py 对齐）
         "err_x": arr("err_x"),
         "err_y": arr("err_y"),
@@ -126,6 +128,11 @@ def prepare_episode_arrays(rows: List[Dict[str, str]], fieldnames: List[str]) ->
     if "wm_pred_goal_xy" in fieldnames:
         data["wm_pred_goal_xy_list"] = np.array(
             [_parse_xy_list(r.get("wm_pred_goal_xy", "")) for r in rows_sorted],
+            dtype=object,
+        )
+    if "cv_pred_goal_xy" in fieldnames:
+        data["cv_pred_goal_xy_list"] = np.array(
+            [_parse_xy_list(r.get("cv_pred_goal_xy", "")) for r in rows_sorted],
             dtype=object,
         )
     return data
@@ -492,6 +499,7 @@ def create_episode_animation(
     (point_auv,) = ax_traj.plot([], [], marker="o", markersize=6)
     (point_goal,) = ax_traj.plot([], [], marker="x", markersize=6)
     (line_pred_goal,) = ax_traj.plot([], [], linestyle=":", linewidth=1.5, alpha=0.9, label="WM pred goal (30)")
+    (line_cv_goal,) = ax_traj.plot([], [], linestyle="--", linewidth=1.2, alpha=0.8, label="CV pred goal (30)")
 
     ax_traj.legend(loc="best")
 
@@ -563,6 +571,7 @@ def create_episode_animation(
         point_auv.set_data([], [])
         point_goal.set_data([], [])
         line_pred_goal.set_data([], [])
+        line_cv_goal.set_data([], [])
         line_dist.set_data([], [])
         line_ex.set_data([], [])
         line_ey.set_data([], [])
@@ -574,6 +583,7 @@ def create_episode_animation(
             point_auv,
             point_goal,
             line_pred_goal,
+            line_cv_goal,
             line_dist,
             line_ex,
             line_ey,
@@ -592,18 +602,28 @@ def create_episode_animation(
         else:
             point_goal.set_data([], [])
 
-            # WM predicted future goal trajectory (world frame)
-            pred_list = data.get("wm_pred_goal_xy_list", None)
-            if pred_list is not None and len(pred_list) > i:
-                pred_xy = pred_list[i]
-                if isinstance(pred_xy, np.ndarray) and pred_xy.size >= 2:
-                    line_pred_goal.set_data(pred_xy[:, 0], pred_xy[:, 1])
-                else:
-                    line_pred_goal.set_data([], [])
+        # WM predicted future goal trajectory (world frame)
+        pred_list = data.get("wm_pred_goal_xy_list", None)
+        if pred_list is not None and len(pred_list) > i:
+            pred_xy = pred_list[i]
+            if isinstance(pred_xy, np.ndarray) and pred_xy.ndim == 2 and pred_xy.shape[1] == 2 and pred_xy.shape[0] > 0:
+                line_pred_goal.set_data(pred_xy[:, 0], pred_xy[:, 1])
             else:
                 line_pred_goal.set_data([], [])
+        else:
+            line_pred_goal.set_data([], [])
 
-        # 误差 + 动作
+        # Constant-velocity baseline predicted goal trajectory (world frame)
+        cv_list = data.get("cv_pred_goal_xy_list", None)
+        if cv_list is not None and len(cv_list) > i:
+            cv_xy = cv_list[i]
+            if isinstance(cv_xy, np.ndarray) and cv_xy.ndim == 2 and cv_xy.shape[1] == 2 and cv_xy.shape[0] > 0:
+                line_cv_goal.set_data(cv_xy[:, 0], cv_xy[:, 1])
+            else:
+                line_cv_goal.set_data([], [])
+        else:
+            line_cv_goal.set_data([], [])
+# 误差 + 动作
         tt = t[: i + 1]
         line_dist.set_data(tt, dist[: i + 1])
         line_ex.set_data(tt, err_x[: i + 1])
@@ -621,6 +641,12 @@ def create_episode_animation(
             f"err_y = {err_y[i]:.3f}",
             f"err_heading = {err_h[i]:.3f} rad",
         ]
+        gvx_arr = data.get("goal_vx", None)
+        gvy_arr = data.get("goal_vy", None)
+        if isinstance(gvx_arr, np.ndarray) and i < len(gvx_arr) and not np.isnan(gvx_arr[i]):
+            msg_lines.append(f"goal_vx = {gvx_arr[i]:.3f}")
+        if isinstance(gvy_arr, np.ndarray) and i < len(gvy_arr) and not np.isnan(gvy_arr[i]):
+            msg_lines.append(f"goal_vy = {gvy_arr[i]:.3f}")
         wm_conf_arr = data.get("wm_conf", None)
         wm_mse_arr = data.get("wm_mse_local", None)
         if wm_conf_arr is not None and i < len(wm_conf_arr) and not np.isnan(wm_conf_arr[i]):
@@ -638,6 +664,7 @@ def create_episode_animation(
             point_auv,
             point_goal,
             line_pred_goal,
+            line_cv_goal,
             line_dist,
             line_ex,
             line_ey,

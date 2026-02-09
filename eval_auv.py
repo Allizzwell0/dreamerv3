@@ -51,6 +51,25 @@ except Exception as e:
     _AUV_IMPORT_ERR = e
 
 
+
+def _symlog(a):
+    a = np.asarray(a, dtype=np.float32)
+    return np.sign(a) * np.log1p(np.abs(a))
+
+def _symexp(a):
+    a = np.asarray(a, dtype=np.float32)
+    return np.sign(a) * np.expm1(np.abs(a))
+
+def _pred_is_symlog(pred_scalar: float, true_scalar: float) -> bool:
+    """Heuristic: check whether pred is closer to symlog(true) than to true."""
+    if not (np.isfinite(pred_scalar) and np.isfinite(true_scalar)):
+        return False
+    if abs(true_scalar) < 1e-3:
+        return False
+    sy = math.copysign(math.log1p(abs(true_scalar)), true_scalar)
+    return abs(pred_scalar - sy) < abs(pred_scalar - true_scalar)
+
+
 def _wrap_pi(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
@@ -78,99 +97,7 @@ def _parse_pred_local(outs: Any) -> Optional[np.ndarray]:
     return None
 
 
-def _debug_print_decoder_outputs(
-    *,
-    ep: int,
-    t: int,
-    traj: Dict[str, Any],
-    outs_now: Dict[str, Any],
-    pos_scale: float = 10.0,
-    only_vector: bool = False,
-):
-    """Pretty-print decoder preds vs true obs and their error for debugging."""
-    prefix = "debug/dec_pred/"
-    keys = [k for k in outs_now.keys() if isinstance(k, str) and k.startswith(prefix)]
-    if only_vector:
-        keys = [k for k in keys if k[len(prefix):] == "vector"]
-    keys = sorted(keys)
-    if not keys:
-        print(f"[DEC DEBUG] ep={ep} t={t} (no decoder outputs in outs; did you copy agent_wm30.py?)")
-        return
-
-    # Vector dim names (AUVEnv)
-    vec_names = [
-        "xb", "yb", "dist_td",
-        "cos(theta)", "sin(theta)",
-        "u", "v", "r",
-        "x", "y", "gx", "gy",
-        "phase_cos", "phase_sin", "t_norm",
-    ]
-
-    print("\n" + "=" * 90)
-    print(f"[DEC DEBUG] ep={ep} t={t}")
-
-    for k in keys:
-        obs_key = k[len(prefix):]
-        pred = np.asarray(outs_now[k])
-        pred = np.squeeze(pred)
-        # If (B, ...), take first batch
-        if pred.ndim >= 1 and pred.shape[0] == 1:
-            pred = np.squeeze(pred, axis=0)
-
-        true = traj.get(obs_key, None)
-        if true is None:
-            print(f"  - {obs_key}: true obs not found in traj keys")
-            continue
-        true = np.asarray(true)
-        true = np.squeeze(true)
-
-        # Compute error when numeric
-        err = None
-        try:
-            err = (pred.astype(np.float64) - true.astype(np.float64))
-        except Exception:
-            err = None
-
-        if obs_key == "vector" and pred.ndim == 1 and pred.shape[0] == 15:
-            # Pretty print per-dim
-            print("  - vector(15):")
-            for i, name in enumerate(vec_names):
-                p = float(pred[i])
-                q = float(true[i])
-                e = float(err[i]) if err is not None else float("nan")
-                print(f"      [{i:02d}] {name:>10s} | pred={p: .5f}  true={q: .5f}  err={e: .5f}")
-
-            # Also print the exact local-mse used in gating (scaled pos dims)
-            pos_idx = [0, 1, 2]
-            rest_idx = [3, 4, 5, 6, 7, 12, 13, 14]
-            ppos = pred[pos_idx]
-            qpos = true[pos_idx]
-            prest = pred[rest_idx]
-            qrest = true[rest_idx]
-            err_pos_scaled = (ppos - qpos) / max(pos_scale, 1e-6)
-            err_rest = (prest - qrest)
-            err_local = np.concatenate([err_pos_scaled, err_rest], axis=0)
-            mse_local = float(np.mean(err_local ** 2))
-            wm_mse = _safe_float1(outs_now.get("log/wm_mse_vec_policy", np.nan))
-            wm_conf = _safe_float1(outs_now.get("log/wm_conf", np.nan))
-            print(f"    -> gating_mse(recomputed, pos_scale={pos_scale:g}) = {mse_local:.6g} | outs wm_mse={wm_mse:.6g} wm_conf={wm_conf:.6g}")
-        else:
-            # Scalar or other shapes
-            if pred.ndim == 0:
-                p = float(pred)
-                q = float(true)
-                e = float(err) if err is not None else float("nan")
-                print(f"  - {obs_key}: pred={p:.6g} true={q:.6g} err={e:.6g}")
-            else:
-                # Short summary for arrays
-                absmax = float(np.max(np.abs(err))) if err is not None else float("nan")
-                meanabs = float(np.mean(np.abs(err))) if err is not None else float("nan")
-                print(f"  - {obs_key}: shape={pred.shape} absmax(err)={absmax:.6g} meanabs(err)={meanabs:.6g}")
-
-    print("=" * 90)
-
-
-def _pred_world_from_local(x0: float, y0: float, theta0: float, pred_local: np.ndarray, dt: float) -> Tuple[np.ndarray, np.ndarray]:
+def _pred_world_from_local(x0: float, y0: float, theta0: float, pred_local: np.ndarray, dt: float, *, pred_domain: str = 'auto', ref_vector: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     From predicted local trajectory (H,11):
       0 xb, 1 yb, 2 dist_td, 3 cos, 4 sin, 5 u, 6 v, 7 r, 8 phase_cos, 9 phase_sin, 10 t_norm
@@ -185,6 +112,22 @@ def _pred_world_from_local(x0: float, y0: float, theta0: float, pred_local: np.n
     u = pred_local[:, 5]
     v = pred_local[:, 6]
     r = pred_local[:, 7]
+
+    # pred_local often lives in symlog domain (Dreamer uses symlog for continuous observations).
+    # Convert back to raw domain for geometry/integration when requested.
+    use_symlog = False
+    if pred_domain == "symlog":
+        use_symlog = True
+    elif pred_domain == "auto":
+        if ref_vector is not None and ref_vector.shape[-1] >= 3:
+            # Use dist_td as the most scale-informative channel
+            try:
+                use_symlog = _pred_is_symlog(float(pred_local[0, 2]), float(ref_vector[2]))
+            except Exception:
+                use_symlog = False
+    if use_symlog:
+        xb = _symexp(xb); yb = _symexp(yb)
+        u  = _symexp(u);  v  = _symexp(v);  r  = _symexp(r)
 
     x = float(x0)
     y = float(y0)
@@ -465,13 +408,6 @@ def evaluate_auv(
     overshoot_eps: float = 0.2,
     overshoot_min_steps: int = 20,
     overshoot_require_distdot: bool = True,
-    # debug decoder
-    debug_decoder: bool = False,
-    debug_episode: int = 0,
-    debug_steps: int = 5,
-    debug_every: int = 1,
-    debug_only_vector: bool = False,
-    debug_pos_scale: float = 10.0,
 ) -> Dict[str, float]:
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -502,7 +438,7 @@ def evaluate_auv(
         "reward", "discount",
         "x", "y", "theta",
         "u", "v", "r",
-        "goal_x", "goal_y",
+        "goal_x", "goal_y", "goal_vx", "goal_vy",
         "xe", "ye",
         "dist",
         "dist_td", "dist_dot_td",
@@ -511,7 +447,7 @@ def evaluate_auv(
         "err_x", "err_y", "err_heading",
         "phase_cos", "phase_sin", "t_norm",
         "action_0", "action_1",
-        "wm_conf", "wm_mse_local", "wm_pred_xy_body", "wm_pred_goal_xy", "wm_pred_auv_xy",
+        "wm_conf", "wm_mse_local", "wm_pred_xy_body", "wm_pred_goal_xy", "wm_pred_auv_xy", "cv_pred_goal_xy",
         "is_terminal", "is_last",
     ]
 
@@ -544,6 +480,11 @@ def evaluate_auv(
             zero_act = np.zeros(act_shape, dtype=np.float32)
             traj = env.step({"reset": True, "action": zero_act})  
 
+
+            last_goal_x = float('nan')
+            last_goal_y = float('nan')
+            last_goal_vx = 0.0
+            last_goal_vy = 0.0
 
             ep_return = 0.0
             steps = 0
@@ -579,6 +520,25 @@ def evaluate_auv(
                     phase_cos = float(vec[12])
                     phase_sin = float(vec[13])
                     t_norm = float(vec[14])
+
+                # --- goal velocity (world frame) from finite difference (1st-order baseline) ---
+                # Uses env raw goal_x/goal_y (world frame). If goal is undefined, velocity is NaN.
+                if np.isfinite(goal_x) and np.isfinite(goal_y):
+                    if np.isfinite(last_goal_x) and np.isfinite(last_goal_y):
+                        goal_vx = (goal_x - last_goal_x) / max(dt, 1e-6)
+                        goal_vy = (goal_y - last_goal_y) / max(dt, 1e-6)
+                    else:
+                        goal_vx = 0.0
+                        goal_vy = 0.0
+                else:
+                    goal_vx = float("nan")
+                    goal_vy = float("nan")
+
+                H_cv = 30
+                cv_pred_goal_xy_json = "[]"
+                if np.isfinite(goal_x) and np.isfinite(goal_y) and np.isfinite(goal_vx) and np.isfinite(goal_vy):
+                    cv_pred = [[float(goal_x + goal_vx * (k + 1) * dt), float(goal_y + goal_vy * (k + 1) * dt)] for k in range(H_cv)]
+                    cv_pred_goal_xy_json = json.dumps(cv_pred)
 
                 # TD diagnostics (prefer env log keys)
                 dist_td = float(traj.get("log/dist_td", dist))
@@ -670,29 +630,23 @@ def evaluate_auv(
 
                 outs_now = getattr(policy, "last_outs", None)
                 if outs_now and isinstance(outs_now, dict):
-                    # Optional: print decoder predictions vs true obs for easy sanity checks.
-                    if (
-                        debug_decoder
-                        and ep == int(debug_episode)
-                        and t < int(debug_steps)
-                        and (int(debug_every) <= 1 or (t % int(debug_every) == 0))
-                    ):
-                        _debug_print_decoder_outputs(
-                            ep=ep,
-                            t=t,
-                            traj=traj,
-                            outs_now=outs_now,
-                            pos_scale=float(debug_pos_scale),
-                            only_vector=bool(debug_only_vector),
-                        )
-
                     wm_conf = _safe_float1(outs_now.get("log/wm_conf", np.nan))
                     wm_mse_local = _safe_float1(outs_now.get("log/wm_mse_vec_policy", np.nan))
                     pred_local = _parse_pred_local(outs_now)
                     if pred_local is not None:
-                        wm_pred_xy_body_json = json.dumps(pred_local[:, 0:2].astype(float).tolist())
+                        # pred_local is usually in symlog domain; convert selected channels back to raw for geometry/plotting.
+                        use_symlog = False
+                        try:
+                            use_symlog = _pred_is_symlog(float(pred_local[0, 2]), float(vec[2]))
+                        except Exception:
+                            use_symlog = False
+                        pred_local_raw = np.array(pred_local, dtype=np.float32, copy=True)
+                        if use_symlog:
+                            for j in (0, 1, 2, 5, 6, 7):
+                                pred_local_raw[:, j] = _symexp(pred_local_raw[:, j])
+                        wm_pred_xy_body_json = json.dumps(pred_local_raw[:, 0:2].astype(float).tolist())
                         if not (math.isnan(x) or math.isnan(y)):
-                            goal_xy, auv_xy = _pred_world_from_local(x, y, theta, pred_local, dt)
+                            goal_xy, auv_xy = _pred_world_from_local(x, y, theta, pred_local_raw, dt, pred_domain="raw", ref_vector=vec)
                             wm_pred_goal_xy_json = json.dumps(goal_xy.astype(float).tolist())
                             wm_pred_auv_xy_json = json.dumps(auv_xy.astype(float).tolist())
 
@@ -710,7 +664,7 @@ def evaluate_auv(
                         reward, discount,
                         x, y, theta,
                         u, v, r_val,
-                        goal_x, goal_y,
+                        goal_x, goal_y, goal_vx, goal_vy,
                         xe, ye,
                         dist,
                         dist_td, dist_dot_td,
@@ -720,9 +674,13 @@ def evaluate_auv(
                         phase_cos, phase_sin, t_norm,
                         a0, a1,
                         is_terminal, is_last,
-                        wm_conf, wm_mse_local, wm_pred_xy_body_json, wm_pred_goal_xy_json, wm_pred_auv_xy_json,
+                        wm_conf, wm_mse_local, wm_pred_xy_body_json, wm_pred_goal_xy_json, wm_pred_auv_xy_json, cv_pred_goal_xy_json,
                     ]
                 )
+
+                # update goal history for 1st-order baseline
+                if np.isfinite(goal_x) and np.isfinite(goal_y):
+                    last_goal_x, last_goal_y = goal_x, goal_y
 
                 # end episode?
                 if is_last:
@@ -839,14 +797,6 @@ def main():
     parser.add_argument("--no_overshoot_require_distdot", action="store_false", dest="overshoot_require_distdot")
     parser.set_defaults(overshoot_require_distdot=True)
 
-    # debug: print decoder predictions vs obs for sanity checks
-    parser.add_argument("--debug_decoder", action="store_true", help="Print decoder preds vs true obs and their errors")
-    parser.add_argument("--debug_episode", type=int, default=0, help="Which episode index to print")
-    parser.add_argument("--debug_steps", type=int, default=5, help="How many steps to print in that episode")
-    parser.add_argument("--debug_every", type=int, default=1, help="Print every N steps (within debug_steps)")
-    parser.add_argument("--debug_only_vector", action="store_true", help="Only print vector decoder output")
-    parser.add_argument("--debug_pos_scale", type=float, default=10.0, help="pos_scale used in gating MSE recomputation")
-
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).expanduser()
@@ -865,12 +815,6 @@ def main():
         overshoot_eps=args.overshoot_eps,
         overshoot_min_steps=args.overshoot_min_steps,
         overshoot_require_distdot=args.overshoot_require_distdot,
-        debug_decoder=args.debug_decoder,
-        debug_episode=args.debug_episode,
-        debug_steps=args.debug_steps,
-        debug_every=args.debug_every,
-        debug_only_vector=args.debug_only_vector,
-        debug_pos_scale=args.debug_pos_scale,
     )
 
     if args.summary_json:
